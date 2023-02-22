@@ -4,7 +4,7 @@ Recoll WebUI
 
 This (https://framagit.org/medoc92/recollwebui) is an updated clone of
 Koniu's original version on GitHub (https://github.com/koniu/recoll-webui),
-which has not been updated lately, and is now slightly obsolete.
+which has not been updated lately, and is now slightly obsolete. If you are currently on github, you are seeing a mirror of the framagit repository (you're fine:) ).
 
 As compared to the original, this version has an additional dependancy when
 running the webui-standalone.py server (i.e. not with apache): it uses the
