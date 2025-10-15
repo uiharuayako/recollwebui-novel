@@ -9,7 +9,11 @@ import csv
 import io
 import string
 import shlex
-from recoll_webui import bottle
+try:
+    from recoll_webui import bottle
+except:
+    import bottle
+    
 from urllib.parse import quote as urlquote
 from recoll import recoll, rclextract, rclconfig
 

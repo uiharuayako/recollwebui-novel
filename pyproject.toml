@@ -4,22 +4,25 @@ build-backend = "hatchling.build"
 
 [project]
 name = "recoll-webui"
-version = "1.0"
+version = "2.0.0"
 description = "The Recoll WebUI implements an HTTP server for querying a Recoll index from a Web browser"
 readme = "README.rst"
 requires-python = ">=3.8"
 dependencies = ["waitress"]
+authors = [
+{name = "Konyu", email = "koniu@riseup.net"},
+]
+maintainers = [
+{name = "Jean-Francois Dockes", email = "jf@dockes.org"},
+]
 
-# Define a CLI command
 [project.scripts]
 "webui-standalone.py" = "recoll_webui.webui_standalone:main"
 
-# Include non-Python files in the package
 [tool.hatch.build]
 include = ["recoll_webui/**"]
 exclude = ["*.pyc", "__pycache__"]
 
-# Tell hatch to include data files inside the package
 [tool.hatch.build.targets.wheel]
 packages = ["recoll_webui"]
 

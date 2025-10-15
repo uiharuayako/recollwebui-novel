@@ -5,13 +5,17 @@ def main():
     import sys
     import argparse
     from importlib import resources
-    from recoll_webui import webui
-    from recoll_webui import bottle
-
+    try:
+        from recoll_webui import webui
+        from recoll_webui import bottle
+    except:
+        import webui
+        import bottle
+        
     # Tell bottle how to look up templates, they are not in the script directory any more.
     with resources.path(webui, 'views') as fspath:
         resourcepath = str(fspath)
-    bottle.TEMPLATE_PATH.append(resourcepath)
+    bottle.TEMPLATE_PATH = [resourcepath,]
     staticpath = os.path.join(os.path.dirname(resourcepath), 'static')
     webui.STATIC_DIR = staticpath
     # handle command-line arguments
@@ -29,3 +33,7 @@ def main():
     bottle.run(server='waitress', host=args.addr, port=args.port)
 
 # vim: foldmethod=marker:filetype=python:textwidth=80:ts=4:et
+
+if __name__ == '__main__':
+    main()
+    

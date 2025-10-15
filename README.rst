@@ -7,11 +7,9 @@ Koniu's original version on GitHub (https://github.com/koniu/recoll-webui),
 which has not been updated lately, and is now slightly obsolete. If you are currently
 on github, you are viewing a mirror of the framagit repo (you're fine :) ).
 
-As compared to the original, this version has an additional dependency when
-running the webui-standalone.py server (i.e. not with apache): it uses the
-python3-waitress module which must be installed. This makes
-webui-standalone quite suitable for moderate multiaccess loads with no
-authentication needs.
+As compared to the original, this version has the python3-waitress package as an additional
+dependency when running the webui-standalone.py server (i.e. not with apache). This makes
+webui-standalone quite suitable for moderate multiaccess loads with no authentication needs.
 
 An updated version of the original doc follows.
 
@@ -28,12 +26,12 @@ tool for Unix/Linux.
 Requirements
 ============
 
-All you need to use the WebUI is:
+All you need in addition to the WebUI itself is:
 
 * Python 3.
 * The Python waitress package. You can remove this dependence and run with
-  the internal bottle server by editing webui-standalone.py
-* Recoll 1.20+ and the Recoll Python3 extension (e.g. the python3-recoll package on Debian-derived
+  the internal bottle server by editing webui_standalone.py
+* Recoll 1.40+ and the Recoll Python3 extension (e.g. the python3-recoll package on Debian-derived
   systems).
 * A WEB browser
 
@@ -47,10 +45,37 @@ Installation and Usage on Linux
 
 **Recoll WebUI** can be used as a standalone application or through a web server via
 WSGI/CGI. Regardless of the mode of operation you need Recoll to be configured on your system as the
-WebUI only provides a front-end for searching and does not handle index configuration etc.
+WebUI only provides a front-end for searching.
+
+Python package
+--------------
+
+As of October 2025, the package source has been reorganized to allow for building it as a proper
+Python3 package.
+
+Running 'python3 -m build' in the top directory will create a proper .whl package
+and a source distribution in the 'dist/' subdirectory.
+
+However it is still possible to run the webui-standalone.py script directly from the source
+directory.
+
+Installing
+----------
+
+The package is usable in source form, as cloned from framagit for example. You can also use pip to
+install it from PyPI. In both cases, you will need to make sure that the Recoll Python extension is
+accessible from the chosen environment. The Recoll extension is usually installed as a system
+package, so, on Linux, if using a virtualenv, you will need to link it in there. Under Windows the
+extension is distributed as a .whl, so you just need to install this.
+
 
 Run standalone
 --------------
+
+Because of practical issues with the packaging, the main script has been renamed
+``webui_standalone.py`` in the source tree. It has kept its name of ``webui-standalone.py`` once
+installed from the .whl. Please adjust the name in the following according to the installation
+method.
 
 Run ``webui-standalone.py`` and connect to ``http://localhost:8080``.
 
