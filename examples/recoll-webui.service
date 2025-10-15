@@ -7,7 +7,7 @@
 # Change these below as needed.
 #
 [Unit]
-Description=Recoll Search WebUI
+Description=Recoll Search Web UI
 
 After=network.target
 

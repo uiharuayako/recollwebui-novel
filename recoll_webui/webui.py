@@ -1,6 +1,5 @@
 #{{{ imports
 import os
-import bottle
 import time
 import sys
 import datetime
@@ -10,8 +9,11 @@ import csv
 import io
 import string
 import shlex
+from recoll_webui import bottle
 from urllib.parse import quote as urlquote
 from recoll import recoll, rclextract, rclconfig
+
+STATIC_DIR = './static'
 
 def msg(s):
     print("%s" % s, file=sys.stderr)
@@ -422,7 +424,7 @@ def recoll_search(q):
 #{{{ static
 @bottle.route('/static/:path#.+#')
 def server_static(path):
-    return bottle.static_file(path, root='./static')
+    return bottle.static_file(path, root=STATIC_DIR)
 #}}}
 #{{{ main
 @bottle.route('/')
@@ -473,7 +475,8 @@ def preview(resnum):
         hl = HlMeths()
         txt = rclq.highlight(tdoc.text, ishtml=ishtml, methods=hl)
         pos = txt.find('<head>')
-        ssref = '<link rel="stylesheet" type="text/css" href="../static/style.css">'
+        css = os.path.join(STATIC_DIR, "style.css")
+        ssref = '<link rel="stylesheet" type="text/css" href="' + css + '">'
         if pos >= 0:
             txt = txt[0:pos+6] + ssref + txt[pos+6:]
         else:

@@ -13,6 +13,5 @@ import os
 #os.environ['RECOLL_CONFDIR'] = '/path/to/recoll/configdir'
 
 # change to webui's directory and set up
-os.chdir(os.path.dirname(__file__))
-import webui
-application = webui.bottle.default_app()
+from recoll_webui import bottle
+application = bottle.default_app()
