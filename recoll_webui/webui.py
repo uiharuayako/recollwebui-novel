@@ -435,6 +435,7 @@ def server_static(path):
 @bottle.view('main')
 def main():
     config = get_config()
+    bottle.response.headers['Vary'] = 'Cookie'
     return { 'dirs': get_dirs(config['dirs'], config['dirdepth']),
             'query': get_query(config), 'sorts': SORTS, 'config': config}
 #}}}
@@ -450,6 +451,8 @@ def results():
         config['maxresults'] = nres
     if config['perpage'] == 0:
         config['perpage'] = nres
+    bottle.response.headers['Vary'] = 'Cookie'
+    bottle.response.headers['No-Vary-Search'] = 'key-order'
     return { 'res': res, 'time': timer, 'query': query, 'dirs':
              get_dirs(config['dirs'], config['dirdepth']),
              'qs': qs, 'sorts': SORTS, 'config': config,
@@ -489,6 +492,8 @@ def preview(resnum):
                 txt
         bottle.response.content_type = 'text/html; charset=utf-8'
         return txt
+    bottle.response.headers['Vary'] = 'Cookie'
+    bottle.response.headers['No-Vary-Search'] = 'key-order'
     return tdoc.text
 #}}}
 #{{{ download
@@ -516,6 +521,8 @@ def edit(resnum):
         os.unlink(path)
     except:
         pass
+    bottle.response.headers['Vary'] = 'Cookie'
+    bottle.response.headers['No-Vary-Search'] = 'key-order'
     return f
 #}}}
 #{{{ json
@@ -524,6 +531,8 @@ def get_json():
     config = get_config()
     query = get_query(config)
     qs = query_to_recoll_string(query)
+    bottle.response.headers['Vary'] = 'Cookie'
+    bottle.response.headers['No-Vary-Search'] = 'key-order'
     bottle.response.headers['Content-Type'] = 'application/json'
     bottle.response.headers['Content-Disposition'] = \
       'attachment; filename=recoll-%s.json' % normalise_filename(qs)
@@ -545,6 +554,8 @@ def get_csv():
     query['page'] = 0
     query['snippets'] = 0
     qs = query_to_recoll_string(query)
+    bottle.response.headers['Vary'] = 'Cookie'
+    bottle.response.headers['No-Vary-Search'] = 'key-order'
     bottle.response.headers['Content-Type'] = 'text/csv'
     bottle.response.headers['Content-Disposition'] = \
       'attachment; filename=recoll-%s.csv' % normalise_filename(qs)
