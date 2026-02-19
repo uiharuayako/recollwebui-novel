@@ -44,6 +44,8 @@
         <a href="{{url}}">Open</a>
         <a href="download/{{number-1}}?{{query_string}}">Download</a>
         <a href="preview/{{number-1}}?{{query_string}}" target="_blank">Preview</a>
+        %oneres = query_string + "&rcludi=" + d['rcludi']
+        <a href="results?{{oneres}}">Link</a>
     </div>
     %end
     <div class="search-result-date">{{d['time']}}</div>

@@ -11,6 +11,7 @@ import io
 import string
 import shlex
 from urllib.parse import quote as urlquote
+from urllib.parse import unquote as urlunquote
 from recoll import recoll, rclextract, rclconfig
 
 def msg(s):
@@ -269,6 +270,7 @@ def get_query(config=None):
     defsortidx = config['defsortidx'] if config and 'defsortidx' in config else 0
     query = {
         'query': select([bottle.request.query.query, '']),
+        'rcludi': select([bottle.request.query.rcludi, '']),
         'before': select([bottle.request.query.before, '']),
         'after': select([bottle.request.query.after, '']),
         'dir': select([bottle.request.query.dir, '', '<all>'], [None, '']),
@@ -361,7 +363,12 @@ def recoll_search(q):
     results = []
     query = recoll_initsearch(q)
     nres = query.rowcount
-
+    if "rcludi" in q:
+        rcludi = q["rcludi"]
+        nres = 1
+        q['page'] = 1
+    else:
+        rcludi = None
     if config['maxresults'] == 0:
         config['maxresults'] = nres
     if nres > config['maxresults']:
@@ -381,7 +388,9 @@ def recoll_search(q):
         highlighter = HlMeths()
     else:
         highlighter = None
-    for i in range(config['perpage']):
+
+    udibreak = False
+    while len(results) < config['perpage']:
         try:
             doc = query.fetchone()
             # Later Recoll versions return None at EOL instead of
@@ -389,6 +398,11 @@ def recoll_search(q):
             # Python Database API Specification
             if not doc:
                 break
+            if rcludi:
+                if doc['rcludi'] == rcludi:
+                    udibreak = True
+                else:
+                    continue
         except:
             break
         d = {}
@@ -401,6 +415,7 @@ def recoll_search(q):
         d['label'] = select([d['title'], d['filename'], '?'], [None, ''])
         d['sha'] = hashlib.sha1((d['url']+d['ipath']).encode('utf-8')).hexdigest()
         d['time'] = timestr(d['mtime'], config['timefmt'])
+        d['rcludi'] = urlquote(doc['rcludi'])
         if 'snippets' in q and q['snippets']:
             if highlighter:
                 d['snippet'] = query.makedocabstract(doc, methods=highlighter)
@@ -414,6 +429,8 @@ def recoll_search(q):
         #for n,v in d.items():
         #    print("type(%s) is %s" % (n,type(v)))
         results.append(d)
+        if udibreak:
+            break
     tend = datetime.datetime.now()
     return results, nres, tend - tstart
 #}}}
