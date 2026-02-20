@@ -347,7 +347,7 @@ def recoll_initsearch(q):
     except Exception as ex:
         msg("Query execute failed: %s" % ex)
         pass
-    return query
+    return query, db
 #}}}
 #{{{ HlMeths
 class HlMeths:
@@ -361,9 +361,9 @@ def recoll_search(q):
     config = get_config()
     tstart = datetime.datetime.now()
     results = []
-    query = recoll_initsearch(q)
+    query,_ = recoll_initsearch(q)
     nres = query.rowcount
-    if "rcludi" in q:
+    if "rcludi" in q and q["rcludi"]:
         rcludi = q["rcludi"]
         nres = 1
         q['page'] = 1
@@ -476,11 +476,22 @@ def preview(resnum):
     config = get_config()
     query = get_query(config)
     qs = query_to_recoll_string(query)
-    rclq = recoll_initsearch(query)
-    if resnum > rclq.rowcount - 1:
-        return 'Bad result index %d' % resnum
-    rclq.scroll(resnum)
-    doc = rclq.fetchone()
+    rclq,db = recoll_initsearch(query)
+    if "rcludi" in query and query["rcludi"]:
+        # Notes: if the initial path had non-utf8 chars, they would have \xnn encoded and we should
+        # decode them with codecs.escape_decode(query['rcludi']. Howvever, this is not foolproof
+        # because the original path could have contained litteral \xnn (4 ascii chars) sequences:
+        # implausible, but not impossible. So for now let well enough alone.
+        # Also: this currently does not work with additional indexes because we'd need to pass the
+        # idxi, but we can't access it from python. This will be fixed in recoll versions from
+        # 1.43.13, and we will have to add the idxi to the urls along with rcludi
+        doc = db.getDoc(query['rcludi'])
+    else:
+        # Actually we should never get there, we always set an udi in the doc links
+        if resnum > rclq.rowcount - 1:
+            return 'Bad result index %d' % resnum
+        rclq.scroll(resnum)
+        doc = rclq.fetchone()
     xt = rclextract.Extractor(doc)
     tdoc = xt.textextract(doc.ipath)
     if tdoc.mimetype == 'text/html':
@@ -512,11 +523,16 @@ def edit(resnum):
     config = get_config()
     query = get_query(config)
     qs = query_to_recoll_string(query)
-    rclq = recoll_initsearch(query)
-    if resnum > rclq.rowcount - 1:
-        return 'Bad result index %d' % resnum
-    rclq.scroll(resnum)
-    doc = rclq.fetchone()
+    rclq,db = recoll_initsearch(query)
+    if "rcludi" in query and query["rcludi"]:
+        # See comment in preview
+        doc = db.getDoc(query['rcludi'])
+    else:
+        # Actually we should never get there, we always set an udi in the doc links
+        if resnum > rclq.rowcount - 1:
+            return 'Bad result index %d' % resnum
+        rclq.scroll(resnum)
+        doc = rclq.fetchone()
     bottle.response.content_type = doc.mimetype
     xt = rclextract.Extractor(doc)
     path = xt.idoctofile(doc.ipath, doc.mimetype)
