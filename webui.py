@@ -271,7 +271,6 @@ def get_query(config=None):
     defsortidx = config['defsortidx'] if config and 'defsortidx' in config else 0
     query = {
         'query': select([bottle.request.query.query, '']),
-        'rcludi': select([bottle.request.query.rcludi, '']),
         'before': select([bottle.request.query.before, '']),
         'after': select([bottle.request.query.after, '']),
         'dir': select([bottle.request.query.dir, '', '<all>'], [None, '']),
@@ -281,6 +280,8 @@ def get_query(config=None):
         'highlight': int(select([bottle.request.query.highlight, 1], [None, ''])),
         'snippets': int(select([bottle.request.query.snippets, 1], [None, ''])),
     }
+    if bottle.request.query.rcludi:
+        query['rcludi'] = bottle.request.query.rcludi
     #msg("query['query'] : %s" % query['query'])
     return query
 #}}}
