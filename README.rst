@@ -139,7 +139,11 @@ The following are not changeable from the user interface:
   `idxsynonyms` value should be the same string if it is to be used.
 - webui_shortenpaths (1) shorten the folder paths shown in the result list by removing the common
   prefix. The default is to do it, set to 0 to show complete paths.
-  
+- webui_permlinks (0) add the Recoll `rcludi` unique identifier to Preview and Download links so that
+  they become stable and bookmarkable.
+- webui_res_permlink (0) add a stable link to the result itself (right of `Preview` and `Download`).
+
+
 Running the indexer
 -------------------
 

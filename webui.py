@@ -11,7 +11,6 @@ import io
 import string
 import shlex
 from urllib.parse import quote as urlquote
-from urllib.parse import unquote as urlunquote
 from recoll import recoll, rclextract, rclconfig
 
 def msg(s):
@@ -53,6 +52,8 @@ DEFAULTS = {
     "noresultlinks":  0,
     "logquery": 0,
     "shortenpaths": 1,
+    "permlinks": 0,
+    "res_permlink": 0,
 }
 
 # sort fields/labels
@@ -198,7 +199,7 @@ def get_config():
     fetches = [("context", 1), ("stem", 1),("timefmt", 0),("dirdepth", 1),("maxchars", 1),
                ("maxresults", 1), ("perpage", 1), ("csvfields", 0), ("title_link", 0),
                ("collapsedups", 1), ("synonyms", 0), ("noresultlinks", 1), ("logquery", 1),
-               ("shortenpaths", 1),
+               ("shortenpaths", 1), ("permlinks", 1), ("res_permlink", 1),
                ]
     for k, isint in fetches:
         value = rclconf.getConfParam("webui_" + k)
@@ -415,7 +416,7 @@ def recoll_search(q):
         d['label'] = select([d['title'], d['filename'], '?'], [None, ''])
         d['sha'] = hashlib.sha1((d['url']+d['ipath']).encode('utf-8')).hexdigest()
         d['time'] = timestr(d['mtime'], config['timefmt'])
-        d['rcludi'] = urlquote(doc['rcludi'])
+        d['rcludi'] = doc['rcludi']
         if 'snippets' in q and q['snippets']:
             if highlighter:
                 d['snippet'] = query.makedocabstract(doc, methods=highlighter)
@@ -478,16 +479,16 @@ def preview(resnum):
     qs = query_to_recoll_string(query)
     rclq,db = recoll_initsearch(query)
     if "rcludi" in query and query["rcludi"]:
+        # Permlinks active
         # Notes: if the initial path had non-utf8 chars, they would have \xnn encoded and we should
         # decode them with codecs.escape_decode(query['rcludi']. Howvever, this is not foolproof
         # because the original path could have contained litteral \xnn (4 ascii chars) sequences:
         # implausible, but not impossible. So for now let well enough alone.
         # Also: this currently does not work with additional indexes because we'd need to pass the
-        # idxi, but we can't access it from python. This will be fixed in recoll versions from
+        # idxi, but we can't access it from Python. This will be fixed in recoll versions from
         # 1.43.13, and we will have to add the idxi to the urls along with rcludi
         doc = db.getDoc(query['rcludi'])
     else:
-        # Actually we should never get there, we always set an udi in the doc links
         if resnum > rclq.rowcount - 1:
             return 'Bad result index %d' % resnum
         rclq.scroll(resnum)
@@ -528,7 +529,6 @@ def edit(resnum):
         # See comment in preview
         doc = db.getDoc(query['rcludi'])
     else:
-        # Actually we should never get there, we always set an udi in the doc links
         if resnum > rclq.rowcount - 1:
             return 'Bad result index %d' % resnum
         rclq.scroll(resnum)

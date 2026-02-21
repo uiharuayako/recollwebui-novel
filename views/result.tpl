@@ -1,7 +1,11 @@
 %import shlex, unicodedata, os, sys
 <div class="search-result">
     %number = (query['page'] - 1)*config['perpage'] + i + 1
-    %oneresquery = query_string + "&rcludi=" + d['rcludi']
+    %if config["permlinks"]:
+        %if query_string.find("&rcludi=") == -1:
+            %query_string += "&rcludi=" + d["rcludi"]
+        %end
+    %end
     <div class="search-result-number"><a href="#r{{d['sha']}}">#{{number}}</a></div>
     %url = d['url'].replace('file://', '')
     %for dr, prefix in config['mounts'].items():
@@ -12,10 +16,10 @@
         %if config['title_link'] == 'open':
             <a href="{{url}}">{{d['label']}}</a>
         %elif config['title_link'] == 'preview':
-            <a href="preview/{{number-1}}?{{oneresquery}}">{{d['label']}}</a>
+            <a href="preview/{{number-1}}?{{query_string}}">{{d['label']}}</a>
         %end
     %else:
-        <a href="download/{{number-1}}?{{oneresquery}}">{{d['label']}}</a>
+        <a href="download/{{number-1}}?{{query_string}}">{{d['label']}}</a>
     %end
     </div>
     %if len(d['ipath']) > 0:
@@ -43,9 +47,11 @@
     %if not "noresultlinks" in config or not config["noresultlinks"]:
     <div class="search-result-links">
         <a href="{{url}}">Open</a>
-        <a href="download/{{number-1}}?{{oneresquery}}">Download</a>
-        <a href="preview/{{number-1}}?{{oneresquery}}" target="_blank">Preview</a>
-        <a href="results?{{oneresquery}}">Link</a>
+        <a href="download/{{number-1}}?{{query_string}}">Download</a>
+        <a href="preview/{{number-1}}?{{query_string}}" target="_blank">Preview</a>
+        %if config["permlinks"] and config["res_permlink"]:
+            <a href="results?{{query_string}}">Link</a>
+        %end
     </div>
     %end
     <div class="search-result-date">{{d['time']}}</div>
