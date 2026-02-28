@@ -21,7 +21,7 @@ body {	margin: 0; font-family: sans-serif }
 }
 #downloads a:hover { background: #ccc; color: white  }
 
-#pages { clear: both; float: none; width: 100%; text-align: center; }
+.pages { clear: both; float: none; width: 100%; text-align: center; }
 .page {
 	font-size: 8pt;
 	color: gray;
@@ -87,7 +87,7 @@ body {	margin: 0; font-family: sans-serif }
 
 a { text-decoration: none }
 table td {
-	padding: 10;
+	padding: 10px;
 	border-right: 1px dotted black ;
 	border-collapse: collapse;
 }

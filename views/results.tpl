@@ -3,7 +3,7 @@
 <div id="status">
     <div id="found">
         Found <b>{{nres}}</b> matching: <b><i>{{qs}}</i></b>
-        <small class="gray">({{time.seconds}}.{{time.microseconds/10000}}s)</small>
+        <small class="gray">({{"%.3f" % time.total_seconds()}} s)</small>
     </div>
     %if len(res) > 0 and not config['rclc_nojsoncsv']:
         <div id="downloads">

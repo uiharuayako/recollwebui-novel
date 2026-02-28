@@ -10,7 +10,7 @@
 %if nres > 0:
 	%npages = int(math.ceil(nres/float(config['perpage'])))
 	%if npages > 1:
-		<div id="pages">
+		<div class="pages">
 		<a title="First" class="page" href="{{page_href(1)}}">&#171;</a>
 		<a title="Previous" class="page" href="{{page_href(max(1,query['page']-1))}}">&#8249;</a> &nbsp;
 		%offset = ((query['page'])//10)*10
