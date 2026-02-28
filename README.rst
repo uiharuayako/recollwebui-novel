@@ -142,7 +142,8 @@ The following are not changeable from the user interface:
 - webui_permlinks (0) add the Recoll `rcludi` unique identifier to Preview and Download links so that
   they become stable and bookmarkable.
 - webui_res_permlink (0) add a stable link to the result itself (right of `Preview` and `Download`).
-
+- webui_queryfrag query fragment to append to all user queries (e.g.: -mime:inode/directory to not
+  show results which are actually folders).
 
 Running the indexer
 -------------------

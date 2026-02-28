@@ -199,7 +199,7 @@ def get_config():
     fetches = [("context", 1), ("stem", 1),("timefmt", 0),("dirdepth", 1),("maxchars", 1),
                ("maxresults", 1), ("perpage", 1), ("csvfields", 0), ("title_link", 0),
                ("collapsedups", 1), ("synonyms", 0), ("noresultlinks", 1), ("logquery", 1),
-               ("shortenpaths", 1), ("permlinks", 1), ("res_permlink", 1),
+               ("shortenpaths", 1), ("permlinks", 1), ("res_permlink", 1), ("queryfrag", 0),
                ]
     for k, isint in fetches:
         value = rclconf.getConfParam("webui_" + k)
@@ -342,6 +342,8 @@ def recoll_initsearch(q):
     query.sortby(q['sort'], q['ascending'])
     try:
         qs = query_to_recoll_string(q)
+        if "queryfrag" in config and config["queryfrag"]:
+            qs += " " + config["queryfrag"]
         if "logquery" in config and config["logquery"]:
             msg(f"Query: {qs}")
         query.execute(qs, config['stem'], config['stemlang'],
@@ -477,7 +479,6 @@ def results():
 def preview(resnum):
     config = get_config()
     query = get_query(config)
-    qs = query_to_recoll_string(query)
     rclq,db = recoll_initsearch(query)
     if "rcludi" in query and query["rcludi"]:
         # Permlinks active
@@ -524,7 +525,6 @@ def preview(resnum):
 def edit(resnum):
     config = get_config()
     query = get_query(config)
-    qs = query_to_recoll_string(query)
     rclq,db = recoll_initsearch(query)
     if "rcludi" in query and query["rcludi"]:
         # See comment in preview
