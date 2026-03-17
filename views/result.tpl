@@ -1,9 +1,10 @@
 %import shlex, unicodedata, os, sys
+%from urllib.parse import quote as urlquote
 <div class="search-result">
     %number = (query['page'] - 1)*config['perpage'] + i + 1
     %if config["permlinks"]:
         %if query_string.find("&rcludi=") == -1:
-            %query_string += "&rcludi=" + d["rcludi"]
+            %query_string += "&rcludi=" + urlquote(d["rcludi"])
         %end
     %end
     <div class="search-result-number"><a href="#r{{d['sha']}}">#{{number}}</a></div>
