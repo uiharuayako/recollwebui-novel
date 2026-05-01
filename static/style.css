@@ -1,12 +1,14 @@
 body {	margin: 0; font-family: sans-serif }
-* { font-family: inherit  }
+* { font-family: inherit; box-sizing: border-box }
 #searchbox {
 	background: #eee;
 	border-bottom: 1px solid #666;
+	padding: 0.25em 0;
 }
 
 #status {
-	margin: 1em;
+	margin: 1em auto;
+	max-width: 1100px;
 	background: #fcfcfc;
 	border: 1px solid #eaeaea;
 	color: #666;
@@ -33,7 +35,7 @@ body {	margin: 0; font-family: sans-serif }
 }
 .page:hover, .current { background: #ccc; color: white; }
 
-#results { padding: 1em; }
+#results { padding: 1em; max-width: 1100px; margin: 0 auto; }
 .search-result {
 	margin-left: 15%;
 	margin-right: 15%;
@@ -72,6 +74,7 @@ body {	margin: 0; font-family: sans-serif }
 	padding-left: 1em;
 	color: #444; clear: both;
 	font-family: serif;
+	overflow-wrap: break-word;
 }
 .search-result-url { clear:left; }
 .search-result-url a { color: #5a5; font-size: 8pt; float: left; margin-right: 1em;}
@@ -91,6 +94,21 @@ table td {
 	border-right: 1px dotted black ;
 	border-collapse: collapse;
 }
+#form {
+	width: 100%;
+	max-width: 1100px;
+	margin: 0 auto;
+	table-layout: fixed;
+}
+#query-cell { width: 42%; }
+#sort-cell { width: 22%; }
+.button-row {
+	display: flex;
+	gap: 4px;
+}
+.button-row > * { flex: 1; min-width: 0; }
+.button-row a { display: block; }
+
 table td:last-child {
 	border-right: 0px;
 }
@@ -109,17 +127,17 @@ input:focus, button:focus, select:focus{
 	color: black;
 }
 input[type=button],input[type=reset],input[type=submit] { width: 32%; }
+.button-row input { width: 100%; }
 input[type=button]:hover,input[type=reset]:hover,input[type=submit]:hover{ color:white; background: #ccc; cursor: pointer; }
-input[type=reset]:hover,input[type=submit]:hover { }
-input[name=before], input[name=after] { width: 45% }
+.date-range { display: flex; align-items: center; gap: 4px; }
+.date-range input { flex: 1; min-width: 0; }
 tr { vertical-align: top }
 
 #settings-box {
 	padding: 1em;
-	position: absolute;
-	top: 5%;
-	left: 30%;
-	right: 30%;
+	position: relative;
+	width: min(760px, calc(100% - 2em));
+	margin: 2em auto;
 	background: #eee;
 	border: 1px solid #999;
 }
@@ -132,5 +150,135 @@ hr { border: 1px solid #999 }
 	opacity: 0.7;
 	background: white;
 	display: none;
+}
+
+@media (max-width: 900px) {
+	.search-result {
+		margin-left: 8%;
+		margin-right: 8%;
+	}
+
+	#settings-box {
+		width: min(680px, calc(100% - 2em));
+	}
+}
+
+@media (max-width: 700px) {
+	#searchbox {
+		padding: 0.75em 0;
+	}
+
+	#status,
+	#results {
+		padding-left: 0.75em;
+		padding-right: 0.75em;
+	}
+
+	#status {
+		margin: 0.75em;
+	}
+
+	#found,
+	#downloads {
+		float: none;
+		display: block;
+		border-left: 0;
+		padding: 0.5em;
+	}
+
+	.pages {
+		padding: 0 0.5em;
+	}
+
+	#form,
+	#form tbody,
+	#form tr,
+	#form td {
+		display: block;
+		width: 100% !important;
+	}
+	.qspacer { display: none; }
+
+	table td {
+		border-right: 0;
+		border-bottom: 1px dotted black;
+		padding: 0.75em;
+	}
+
+	table td:last-child {
+		border-bottom: 0;
+	}
+
+	input[type=button], input[type=reset], input[type=submit] {
+		width: 100%;
+		display: block;
+		margin-bottom: 0.5em;
+	}
+
+	.button-row {
+		flex-direction: column;
+		gap: 6px;
+		margin-top: 0.5em;
+	}
+	.button-row input {
+		margin-bottom: 0;
+	}
+
+	.search-result {
+		margin-left: 0;
+		margin-right: 0;
+		padding: 0.85em 0.9em 0.7em;
+		border: 1px solid #eee;
+	}
+
+	.search-result-number {
+		float: none;
+		width: auto;
+		margin-left: 0;
+		margin-bottom: 0.35em;
+		text-align: left;
+	}
+
+	.search-result-title,
+	.search-result-ipath {
+		float: none;
+		display: inline;
+		font-size: 11pt;
+	}
+
+	.search-result-ipath {
+		display: block;
+		padding-left: 0;
+		margin-top: 0.2em;
+	}
+
+	.search-result-date,
+	.search-result-url a,
+	.search-result-links {
+		float: none;
+		display: block;
+	}
+
+	.search-result-date {
+		margin-bottom: 0.5em;
+	}
+
+	.search-result-links {
+		visibility: visible;
+		margin: 0.2em 0 0.4em;
+	}
+
+	.search-result-author {
+		margin-top: 0.35em;
+	}
+
+	.search-result-snippet {
+		padding-left: 0.75em;
+	}
+
+	#settings-box {
+		width: calc(100% - 1.5em);
+		margin: 0.75em auto;
+	}
 }
 
