@@ -25,6 +25,10 @@ except ImportError:
 
 g_fscharset=sys.getfilesystemencoding()
 
+g_tmpdir = os.getenv("RECOLL_TMPDIR")
+if not g_tmpdir:
+    g_tmpdir = os.getenv("TMPDIR")
+    
 #}}}
 #{{{ settings
 # settings defaults
@@ -445,6 +449,12 @@ def recoll_search(q):
 def server_static(path):
     return bottle.static_file(path, root='./static')
 #}}}
+@bottle.route('/staticdoc/:path#.+#')
+def server_staticdoc(path):
+    if not g_tmpdir:
+        return ""
+    return bottle.static_file(path, root=g_tmpdir)
+#}}}
 #{{{ main
 @bottle.route('/')
 @bottle.view('main')
@@ -534,23 +544,17 @@ def edit(resnum):
             return 'Bad result index %d' % resnum
         rclq.scroll(resnum)
         doc = rclq.fetchone()
-    bottle.response.content_type = doc.mimetype
     xt = rclextract.Extractor(doc)
     path = xt.idoctofile(doc.ipath, doc.mimetype)
     if "filename" in doc.keys():
         filename = doc.filename
     else:
         filename = os.path.basename(path)
-    bottle.response.headers['Content-Disposition'] = f'attachment; filename="{filename}"'
-    bottle.response.headers['Content-Length'] = os.stat(path).st_size
-    f = open(path, 'rb')
-    try:
-        os.unlink(path)
-    except:
-        pass
-    bottle.response.headers['Vary'] = 'Cookie'
-    bottle.response.headers['No-Vary-Search'] = 'key-order'
-    return f
+    return \
+        "<html><head></head><body><script>" \
+        f"window.location.replace(\"/staticdoc/{filename}#page=3&search=unreliable\");" \
+        "</script></body></html>"
+
 #}}}
 #{{{ json
 @bottle.route('/json')
