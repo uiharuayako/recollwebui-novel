@@ -6,7 +6,7 @@ $(document).ready(function(){
 	})
 	if ($("#results").length) { $("input").blur() }
 	$('input[name="after"]').jdPicker({});
-	$('input[name="before"]').jdPicker();
+	$('input[name="before"]').jdPicker({});
 })
 
 function addOpenSearch()
