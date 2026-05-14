@@ -25,6 +25,10 @@ except ImportError:
 
 g_fscharset=sys.getfilesystemencoding()
 
+g_tmpdir = os.getenv("RECOLL_TMPDIR")
+if not g_tmpdir:
+    g_tmpdir = os.getenv("TMPDIR")
+    
 #}}}
 #{{{ settings
 # settings defaults
@@ -416,6 +420,13 @@ def recoll_search(q):
                 d[f] = v
             else:
                 d[f] = ''
+        if doc['mtype'] == "application/pdf" and doc['url'].startswith("file://"):
+            try:
+                # Note: getfirstmatchpage is only available from recoll 1.44
+                pagenum, term = query.getfirstmatchpage(doc)
+                d['url'] += f"#page={pagenum}&search={urlquote(term)}"
+            except:
+                pass
         d['label'] = select([d['title'], d['filename'], '?'], [None, ''])
         d['sha'] = hashlib.sha1((d['url']+d['ipath']).encode('utf-8')).hexdigest()
         d['time'] = timestr(d['mtime'], config['timefmt'])
@@ -444,6 +455,12 @@ def recoll_search(q):
 @bottle.route('/static/:path#.+#')
 def server_static(path):
     return bottle.static_file(path, root='./static')
+#}}}
+@bottle.route('/staticdoc/:path#.+#')
+def server_staticdoc(path):
+    if not g_tmpdir:
+        return ""
+    return bottle.static_file(path, root=g_tmpdir)
 #}}}
 #{{{ main
 @bottle.route('/')
@@ -534,23 +551,37 @@ def edit(resnum):
             return 'Bad result index %d' % resnum
         rclq.scroll(resnum)
         doc = rclq.fetchone()
-    bottle.response.content_type = doc.mimetype
     xt = rclextract.Extractor(doc)
     path = xt.idoctofile(doc.ipath, doc.mimetype)
     if "filename" in doc.keys():
         filename = doc.filename
     else:
         filename = os.path.basename(path)
-    bottle.response.headers['Content-Disposition'] = f'attachment; filename="{filename}"'
-    bottle.response.headers['Content-Length'] = os.stat(path).st_size
-    f = open(path, 'rb')
+    pagenum = -1
     try:
-        os.unlink(path)
+        # Note: getfirstmatchpage is only available from recoll 1.44
+        pagenum, term = rclq.getfirstmatchpage(doc)
     except:
         pass
-    bottle.response.headers['Vary'] = 'Cookie'
-    bottle.response.headers['No-Vary-Search'] = 'key-order'
-    return f
+    if pagenum != -1 and doc.mimetype == "application/pdf":
+        return \
+            "<html><head></head><body><script>" \
+            f"window.location.replace(\"/staticdoc/{filename}#page={pagenum}&search={term}\");" \
+            "</script></body></html>"
+    else:
+        bottle.response.content_type = doc.mimetype
+        bottle.response.headers['Content-Disposition'] = f'attachment; filename="{filename}"'
+        bottle.response.headers['Content-Length'] = os.stat(path).st_size
+        f = open(path, 'rb')
+        try:
+            os.unlink(path)
+        except:
+            pass
+        bottle.response.headers['Vary'] = 'Cookie'
+        bottle.response.headers['No-Vary-Search'] = 'key-order'
+        return f
+
+        
 #}}}
 #{{{ json
 @bottle.route('/json')
