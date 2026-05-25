@@ -9,6 +9,8 @@
     %end
     <div class="search-result-number"><a href="#r{{d['sha']}}">#{{number}}</a></div>
     %url = d['url'].replace('file://', '')
+    %reader_ext = os.path.splitext(d['filename'] or d['label'] or '')[1].lower().lstrip('.')
+    %reader_supported = reader_ext in ('txt', 'epub', 'mobi', 'azw', 'azw3', 'fb2', 'docx', 'md', 'html', 'htm', 'xhtml', 'xml', 'mhtml', 'pdf', 'cbz', 'cbr', 'cbt', 'cb7')
     %for dr, prefix in config['mounts'].items():
         %url = url.replace(dr, prefix)
     %end
@@ -50,6 +52,10 @@
         <a href="{{url}}">Open</a>
         <a href="download/{{number-1}}?{{query_string}}">Download</a>
         <a href="preview/{{number-1}}?{{query_string}}" target="_blank">Preview</a>
+        %if reader_supported:
+            <a href="reader?mode=book&resnum={{number-1}}&{{query_string}}" target="_blank">阅读本书</a>
+            <a href="reader?mode=folder&resnum={{number-1}}&{{query_string}}" target="_blank">阅读所在文件夹</a>
+        %end
         %if config["permlinks"] and config["res_permlink"]:
             <a href="results?{{query_string}}">Link</a>
         %end

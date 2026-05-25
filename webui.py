@@ -6,11 +6,13 @@ import sys
 import datetime
 import glob
 import hashlib
+import hmac
+import base64
 import csv
 import io
 import string
 import shlex
-from urllib.parse import quote as urlquote
+from urllib.parse import quote as urlquote, unquote as urlunquote
 from recoll import recoll, rclextract, rclconfig
 
 def msg(s):
@@ -59,6 +61,33 @@ DEFAULTS = {
     "permlinks": 0,
     "res_permlink": 0,
 }
+
+READER_SUPPORTED_FORMATS = {
+    "txt",
+    "epub",
+    "mobi",
+    "azw",
+    "azw3",
+    "fb2",
+    "docx",
+    "md",
+    "html",
+    "htm",
+    "xhtml",
+    "xml",
+    "mhtml",
+    "pdf",
+    "cbz",
+    "cbr",
+    "cbt",
+    "cb7",
+}
+
+READER_FOLDER_SCAN_LIMIT = 1000
+READER_TOKEN_TTL = 60 * 60 * 12
+READER_TOKEN_SECRET = os.environ.get("RECOLL_READER_TOKEN_SECRET")
+if not READER_TOKEN_SECRET:
+    READER_TOKEN_SECRET = base64.urlsafe_b64encode(os.urandom(32)).decode("ascii")
 
 # sort fields/labels
 SORTS = [
@@ -130,6 +159,237 @@ def safe_envget(varnm):
         return os.environ[varnm]
     except Exception as ex:
         return None
+
+def normalize_file_path(path):
+    if not path:
+        return ""
+    path = urlunquote(path)
+    if path.startswith("file://"):
+        path = path[len("file://") :]
+    return os.path.realpath(path)
+
+def get_reader_format_from_name(name, mtype=""):
+    ext = os.path.splitext(name or "")[1].lower().lstrip(".")
+    if ext in READER_SUPPORTED_FORMATS:
+        return ext
+    mtype = (mtype or "").lower()
+    mimetype_map = {
+        "text/plain": "txt",
+        "text/markdown": "md",
+        "text/html": "html",
+        "application/xhtml+xml": "xhtml",
+        "application/xml": "xml",
+        "application/pdf": "pdf",
+        "application/epub+zip": "epub",
+        "application/x-fictionbook+xml": "fb2",
+        "application/fb2+xml": "fb2",
+        "application/vnd.amazon.ebook": "azw3",
+        "application/x-mobipocket-ebook": "mobi",
+        "application/x-cbz": "cbz",
+        "application/x-cbr": "cbr",
+        "application/x-cbt": "cbt",
+        "application/x-cb7": "cb7",
+    }
+    return mimetype_map.get(mtype, "")
+
+def get_doc_display_name(doc):
+    name = ""
+    try:
+        name = getattr(doc, "filename", "") or ""
+    except Exception:
+        name = ""
+    if not name:
+        try:
+            name = os.path.basename(normalize_file_path(getattr(doc, "url", "") or ""))
+        except Exception:
+            name = ""
+    return name
+
+def is_reader_supported_doc(doc):
+    name = get_doc_display_name(doc)
+    return get_reader_format_from_name(name, getattr(doc, "mtype", "")) in READER_SUPPORTED_FORMATS
+
+def get_reader_payload_path(doc):
+    url = normalize_file_path(getattr(doc, "url", "") or "")
+    if url and os.path.exists(url):
+        return url
+    xt = rclextract.Extractor(doc)
+    return normalize_file_path(xt.idoctofile(doc.ipath, doc.mimetype))
+
+def is_allowed_reader_path(path, config):
+    if not path:
+        return False
+    real_path = os.path.realpath(path)
+    for d in config["dirs"]:
+        try:
+            root = os.path.realpath(d)
+            if os.path.commonpath([real_path, root]) == root:
+                return True
+        except Exception:
+            continue
+    return False
+
+def make_reader_token(path, mimetype="", name=""):
+    payload = {
+        "path": os.path.realpath(path),
+        "mimetype": mimetype or "",
+        "name": name or "",
+        "exp": int(time.time()) + READER_TOKEN_TTL,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    payload_b64 = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    signature = hmac.new(
+        READER_TOKEN_SECRET.encode("utf-8"),
+        payload_b64.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    sig_b64 = base64.urlsafe_b64encode(signature).decode("ascii").rstrip("=")
+    return f"{payload_b64}.{sig_b64}"
+
+def read_reader_token(token):
+    try:
+        payload_b64, sig_b64 = token.split(".", 1)
+        expected = base64.urlsafe_b64encode(
+            hmac.new(
+                READER_TOKEN_SECRET.encode("utf-8"),
+                payload_b64.encode("ascii"),
+                hashlib.sha256,
+            ).digest()
+        ).decode("ascii").rstrip("=")
+        if not hmac.compare_digest(expected, sig_b64):
+            return None
+        raw = base64.urlsafe_b64decode(payload_b64 + "=" * (-len(payload_b64) % 4))
+        payload = json.loads(raw.decode("utf-8"))
+        if int(payload.get("exp", 0)) < int(time.time()):
+            return None
+        path = normalize_file_path(payload.get("path", ""))
+        if not path:
+            return None
+        payload["path"] = path
+        return payload
+    except Exception:
+        return None
+
+def resolve_doc_from_result_query(resnum, query=None):
+    config = get_config()
+    q = query or get_query(config)
+    rclq, db = recoll_initsearch(q)
+    if "rcludi" in q and q["rcludi"]:
+        doc = db.getDoc(q["rcludi"])
+    else:
+        if resnum > rclq.rowcount - 1:
+            bottle.abort(404, "Bad result index %d" % resnum)
+        rclq.scroll(resnum)
+        doc = rclq.fetchone()
+    if not doc:
+        bottle.abort(404, "Document not found")
+    return config, q, rclq, db, doc
+
+def get_reader_path_for_doc(doc, config):
+    path = get_reader_payload_path(doc)
+    if not is_allowed_reader_path(path, config):
+        bottle.abort(403, "Reader access denied")
+    return path
+
+def build_reader_item(doc, config, path):
+    name = get_doc_display_name(doc)
+    reader_format = get_reader_format_from_name(name, getattr(doc, "mtype", ""))
+    token = make_reader_token(path, getattr(doc, "mtype", ""), name)
+    return {
+        "name": name,
+        "title": select([getattr(doc, "title", ""), name, "?"], [None, ""]),
+        "author": getattr(doc, "author", "") or "",
+        "path": path,
+        "format": reader_format,
+        "size": int(getattr(doc, "size", 0) or getattr(doc, "fbytes", 0) or 0),
+        "mtime": int(getattr(doc, "mtime", 0) or 0),
+        "token": token,
+        "url": f"/api/reader/file/{urlquote(token)}",
+        "supported": reader_format in READER_SUPPORTED_FORMATS,
+    }
+
+def scan_reader_folder(current_doc, config):
+    current_path = get_reader_path_for_doc(current_doc, config)
+    root_dir = os.path.dirname(current_path)
+    items = []
+    seen = set()
+    truncated = False
+    current_item = None
+
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        dirnames[:] = sorted([d for d in dirnames if not d.startswith(".")])
+        for filename in sorted([f for f in filenames if not f.startswith(".")]):
+            path = os.path.realpath(os.path.join(dirpath, filename))
+            if path in seen:
+                continue
+            if not os.path.isfile(path):
+                continue
+            reader_format = get_reader_format_from_name(filename)
+            if reader_format not in READER_SUPPORTED_FORMATS:
+                continue
+            if not is_allowed_reader_path(path, config):
+                continue
+            seen.add(path)
+            if len(items) >= READER_FOLDER_SCAN_LIMIT:
+                truncated = True
+                continue
+            item = {
+                "name": filename,
+                "title": os.path.splitext(filename)[0],
+                "author": "",
+                "path": path,
+                "root": root_dir,
+                "format": reader_format,
+                "size": os.path.getsize(path),
+                "mtime": int(os.path.getmtime(path)),
+                "token": make_reader_token(path, "", filename),
+                "url": "",
+                "supported": True,
+            }
+            item["url"] = f"/api/reader/file/{urlquote(item['token'])}"
+            if path == current_path:
+                current_item = item
+            items.append(item)
+
+    items.sort(key=lambda item: os.path.relpath(item["path"], root_dir).lower())
+    current_index = 0
+    for idx, item in enumerate(items):
+        if item["path"] == current_path:
+            current_index = idx
+            current_item = item
+            break
+
+    if current_item is None and os.path.isfile(current_path):
+        current_name = os.path.basename(current_path)
+        current_format = get_reader_format_from_name(current_name)
+        if current_format in READER_SUPPORTED_FORMATS:
+            current_item = {
+                "name": current_name,
+                "title": os.path.splitext(current_name)[0],
+                "author": "",
+                "path": current_path,
+                "root": root_dir,
+                "format": current_format,
+                "size": os.path.getsize(current_path),
+                "mtime": int(os.path.getmtime(current_path)),
+                "token": make_reader_token(current_path, "", current_name),
+                "url": "",
+                "supported": True,
+            }
+            current_item["url"] = f"/api/reader/file/{urlquote(current_item['token'])}"
+            items.insert(0, current_item)
+            current_index = 0
+            if len(items) > READER_FOLDER_SCAN_LIMIT:
+                items.pop()
+                truncated = True
+
+    return {
+        "root": root_dir,
+        "currentIndex": current_index,
+        "items": items,
+        "truncated": truncated,
+        "count": len(items),
+    }
 
 # Get the database directory from recoll.conf, defaults to confdir/xapiandb. Note
 # that this is available as getDbDir() from recoll 1.27 (2020)
@@ -491,27 +751,98 @@ def results():
              'query_string': bottle.request.query_string, 'nres': nres,
              'config': config}
 #}}}
+#{{{ reader page
+@bottle.route('/reader')
+@bottle.view('reader')
+def reader():
+    mode = select([bottle.request.query.mode, "book"], [None, ""])
+    if mode not in ("book", "folder"):
+        bottle.abort(400, "Invalid reader mode")
+    return {
+        "mode": mode,
+        "query_string": bottle.request.query_string,
+    }
+#}}}
+#{{{ reader book api
+@bottle.route('/api/reader/book')
+def reader_book():
+    resnum = int(select([bottle.request.query.resnum, -1], [None, ""]))
+    config, query, rclq, db, doc = resolve_doc_from_result_query(resnum)
+    if not is_reader_supported_doc(doc):
+        bottle.abort(400, "Unsupported format for reader")
+    path = get_reader_path_for_doc(doc, config)
+    item = build_reader_item(doc, config, path)
+    bottle.response.content_type = 'application/json; charset=utf-8'
+    return json.dumps({
+        "mode": "book",
+        "book": item,
+    })
+#}}}
+#{{{ reader folder api
+@bottle.route('/api/reader/folder')
+def reader_folder():
+    resnum = int(select([bottle.request.query.resnum, -1], [None, ""]))
+    config, query, rclq, db, doc = resolve_doc_from_result_query(resnum)
+    if not is_reader_supported_doc(doc):
+        bottle.abort(400, "Unsupported format for reader")
+    folder_data = scan_reader_folder(doc, config)
+    bottle.response.content_type = 'application/json; charset=utf-8'
+    return json.dumps({
+        "mode": "folder",
+        "root": folder_data["root"],
+        "currentIndex": folder_data["currentIndex"],
+        "count": folder_data["count"],
+        "truncated": folder_data["truncated"],
+        "items": folder_data["items"],
+    })
+#}}}
+#{{{ reader file api
+@bottle.route('/api/reader/file/<token>')
+def reader_file(token):
+    payload = read_reader_token(token)
+    if not payload:
+        bottle.abort(403, "Invalid or expired reader token")
+    config = get_config()
+    path = payload["path"]
+    if not is_allowed_reader_path(path, config):
+        bottle.abort(403, "Reader access denied")
+    if not os.path.isfile(path):
+        bottle.abort(404, "Reader file not found")
+    name = payload.get("name") or os.path.basename(path)
+    mimetype = payload.get("mimetype") or ""
+    if not mimetype:
+        ext = get_reader_format_from_name(name)
+        mimetype_map = {
+            "txt": "text/plain",
+            "md": "text/markdown",
+            "html": "text/html",
+            "htm": "text/html",
+            "xhtml": "application/xhtml+xml",
+            "xml": "application/xml",
+            "mhtml": "multipart/related",
+            "epub": "application/epub+zip",
+            "pdf": "application/pdf",
+            "fb2": "application/x-fictionbook+xml",
+            "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "mobi": "application/x-mobipocket-ebook",
+            "azw": "application/vnd.amazon.ebook",
+            "azw3": "application/vnd.amazon.ebook",
+            "cbz": "application/x-cbz",
+            "cbr": "application/x-cbr",
+            "cbt": "application/x-cbt",
+            "cb7": "application/x-cb7",
+        }
+        mimetype = mimetype_map.get(ext, "application/octet-stream")
+    bottle.response.content_type = mimetype
+    bottle.response.headers['Cache-Control'] = 'private, max-age=3600'
+    bottle.response.headers['Content-Length'] = os.stat(path).st_size
+    with open(path, 'rb') as f:
+        return f.read()
+#}}}
 #{{{ preview
 @bottle.route('/preview/<resnum:int>')
 def preview(resnum):
-    config = get_config()
-    query = get_query(config)
-    rclq,db = recoll_initsearch(query)
-    if "rcludi" in query and query["rcludi"]:
-        # Permlinks active
-        # Notes: if the initial path had non-utf8 chars, they would have \xnn encoded and we should
-        # decode them with codecs.escape_decode(query['rcludi']. Howvever, this is not foolproof
-        # because the original path could have contained litteral \xnn (4 ascii chars) sequences:
-        # implausible, but not impossible. So for now let well enough alone.
-        # Also: this currently does not work with additional indexes because we'd need to pass the
-        # idxi, but we can't access it from Python. This will be fixed in recoll versions from
-        # 1.43.13, and we will have to add the idxi to the urls along with rcludi
-        doc = db.getDoc(query['rcludi'])
-    else:
-        if resnum > rclq.rowcount - 1:
-            return 'Bad result index %d' % resnum
-        rclq.scroll(resnum)
-        doc = rclq.fetchone()
+    config, query, rclq, db, doc = resolve_doc_from_result_query(resnum)
     xt = rclextract.Extractor(doc)
     tdoc = xt.textextract(doc.ipath)
     if tdoc.mimetype == 'text/html':
@@ -540,17 +871,7 @@ def preview(resnum):
 #{{{ download
 @bottle.route('/download/<resnum:int>')
 def edit(resnum):
-    config = get_config()
-    query = get_query(config)
-    rclq,db = recoll_initsearch(query)
-    if "rcludi" in query and query["rcludi"]:
-        # See comment in preview
-        doc = db.getDoc(query['rcludi'])
-    else:
-        if resnum > rclq.rowcount - 1:
-            return 'Bad result index %d' % resnum
-        rclq.scroll(resnum)
-        doc = rclq.fetchone()
+    config, query, rclq, db, doc = resolve_doc_from_result_query(resnum)
     xt = rclextract.Extractor(doc)
     path = xt.idoctofile(doc.ipath, doc.mimetype)
     if "filename" in doc.keys():
