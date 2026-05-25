@@ -12,7 +12,7 @@ import csv
 import io
 import string
 import shlex
-from urllib.parse import quote as urlquote, unquote as urlunquote
+from urllib.parse import parse_qsl, urlencode, quote as urlquote, unquote as urlunquote
 from recoll import recoll, rclextract, rclconfig
 
 def msg(s):
@@ -132,6 +132,18 @@ def select(ls, invalid=[None]):
     for value in ls:
         if value not in invalid:
             return value
+
+def select_int(ls, default=0, invalid=[None], minimum=None):
+    value = select(ls, invalid)
+    if value in invalid:
+        return default
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return default
+    if minimum is not None and value < minimum:
+        return minimum
+    return value
 
 def timestr(secs, fmt):
     # Just in case: we had a bug at some point inserting commas in the dmtime field.
@@ -539,10 +551,13 @@ def get_query(config=None):
         'after': select([bottle.request.query.after, '']),
         'dir': select([bottle.request.query.dir, '', '<all>'], [None, '']),
         'sort': select([bottle.request.query.sort, SORTS[defsortidx][0]], [None, '']),
-        'ascending': int(select([bottle.request.query.ascending, 0], [None, ''])),
-        'page': int(select([bottle.request.query.page, 0], [None, ''])),
-        'highlight': int(select([bottle.request.query.highlight, 1], [None, ''])),
-        'snippets': int(select([bottle.request.query.snippets, 1], [None, ''])),
+        'ascending': select_int([bottle.request.query.ascending, 0], default=0),
+        # Reader runtimes may write non-numeric positions like "121:06" into the
+        # browser URL. Treat invalid search page values as "first page" instead
+        # of failing the whole request.
+        'page': select_int([bottle.request.query.page, 0], default=0, minimum=0),
+        'highlight': select_int([bottle.request.query.highlight, 1], default=1),
+        'snippets': select_int([bottle.request.query.snippets, 1], default=1),
     }
     if bottle.request.query.rcludi:
         query['rcludi'] = bottle.request.query.rcludi
@@ -758,15 +773,26 @@ def reader():
     mode = select([bottle.request.query.mode, "book"], [None, ""])
     if mode not in ("book", "folder"):
         bottle.abort(400, "Invalid reader mode")
+    search_query = [
+        (key, value)
+        for key, value in parse_qsl(
+            bottle.request.query_string,
+            keep_blank_values=True,
+            encoding="utf-8",
+            errors="strict",
+        )
+        if key not in ("mode", "resnum")
+    ]
     return {
         "mode": mode,
         "query_string": bottle.request.query_string,
+        "results_query_string": urlencode(search_query, doseq=True, encoding="utf-8", errors="strict"),
     }
 #}}}
 #{{{ reader book api
 @bottle.route('/api/reader/book')
 def reader_book():
-    resnum = int(select([bottle.request.query.resnum, -1], [None, ""]))
+    resnum = select_int([bottle.request.query.resnum, -1], default=-1)
     config, query, rclq, db, doc = resolve_doc_from_result_query(resnum)
     if not is_reader_supported_doc(doc):
         bottle.abort(400, "Unsupported format for reader")
@@ -781,7 +807,7 @@ def reader_book():
 #{{{ reader folder api
 @bottle.route('/api/reader/folder')
 def reader_folder():
-    resnum = int(select([bottle.request.query.resnum, -1], [None, ""]))
+    resnum = select_int([bottle.request.query.resnum, -1], default=-1)
     config, query, rclq, db, doc = resolve_doc_from_result_query(resnum)
     if not is_reader_supported_doc(doc):
         bottle.abort(400, "Unsupported format for reader")
@@ -960,7 +986,7 @@ def settings():
     return get_config()
 
 @bottle.route('/set')
-def set():
+def set_settings():
     config = get_config()
     for k, v in DEFAULTS.items():
         bottle.response.set_cookie(k, str(bottle.request.query.get(k)),

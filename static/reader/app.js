@@ -1,10 +1,12 @@
 const query = new URLSearchParams(window.location.search);
-const mode = window.RECOLL_READER?.mode || query.get('mode') || 'book';
+const readerConfig = window.RECOLL_READER || {};
+const mode = readerConfig.mode || query.get('mode') || 'book';
 const resnum = query.get('resnum') || '0';
-const rawQueryString = (window.RECOLL_READER?.queryString || window.location.search.replace(/^\?/, '')).replaceAll('&amp;', '&');
+const rawQueryString = (readerConfig.queryString || window.location.search.replace(/^\?/, '')).split('&amp;').join('&');
 const searchParams = new URLSearchParams(rawQueryString);
 searchParams.set('resnum', resnum);
 searchParams.set('mode', mode);
+searchParams.delete('page');
 const baseApi = '/api/reader';
 const state = {
   items: [],
@@ -17,7 +19,15 @@ const state = {
   parserRegex: localStorage.getItem('recoll-reader:parserRegex') || '',
 };
 
-window.Kookit ||= {};
+window.Kookit = window.Kookit || {};
+
+// Kookit emits mobile bridge messages in several interaction paths.
+// On desktop browsers there is no native bridge, so provide a safe no-op.
+if (!window.ReactNativeWebView || typeof window.ReactNativeWebView.postMessage !== 'function') {
+  window.ReactNativeWebView = {
+    postMessage() {},
+  };
+}
 
 const el = (id) => document.getElementById(id);
 const stage = el('page-area');
@@ -26,14 +36,16 @@ const titleEl = el('reader-title');
 const metaEl = el('reader-meta');
 const sidebar = el('reader-sidebar');
 const parserInput = el('reader-parser-regex');
+const prevPageButton = el('reader-prev-page');
+const nextPageButton = el('reader-next-page');
 parserInput.value = state.parserRegex;
 
 const safeText = (value) => (value == null ? '' : String(value));
 const escapeHtml = (value) => safeText(value)
-  .replaceAll('&', '&amp;')
-  .replaceAll('<', '&lt;')
-  .replaceAll('>', '&gt;')
-  .replaceAll('"', '&quot;');
+  .split('&').join('&amp;')
+  .split('<').join('&lt;')
+  .split('>').join('&gt;')
+  .split('"').join('&quot;');
 
 const savePosition = (item, position) => {
   if (!item || !item.path) return;
@@ -52,6 +64,12 @@ const loadPosition = (item) => {
   } catch (err) {
     return null;
   }
+};
+
+const isValidTxtPosition = (position) => {
+  if (!position || typeof position !== 'object') return false;
+  const chapterDocIndex = position.chapterDocIndex;
+  return typeof chapterDocIndex === 'number' || typeof chapterDocIndex === 'string';
 };
 
 const saveFolderCursor = (meta) => {
@@ -100,6 +118,59 @@ const cleanupRendition = () => {
   }
 };
 
+const updatePageButtons = () => {
+  const canPage = !!(state.rendition && typeof state.rendition.prev === 'function' && typeof state.rendition.next === 'function');
+  prevPageButton.disabled = !canPage;
+  nextPageButton.disabled = !canPage;
+};
+
+const turnPage = async (direction) => {
+  const rendition = state.rendition;
+  if (!rendition) return;
+  const method = direction < 0 ? rendition.prev : rendition.next;
+  if (typeof method !== 'function') return;
+  try {
+    await method.call(rendition);
+  } catch (err) {
+    console.error(err);
+  }
+};
+
+const shouldHandleStageKey = (event) => {
+  const target = event.target;
+  if (!target) return true;
+  const tagName = target.tagName ? target.tagName.toLowerCase() : '';
+  return !/^(input|textarea|select|button)$/.test(tagName);
+};
+
+const bindIframeNavigation = () => {
+  const iframe = stage.querySelector('#kookit-iframe');
+  if (!iframe || iframe.dataset.readerBound === 'yes') return;
+  const handleKeydown = (event) => {
+    if (!shouldHandleStageKey(event)) return;
+    if (event.key === 'ArrowLeft' || event.key === 'PageUp') {
+      event.preventDefault();
+      void turnPage(-1);
+    } else if (event.key === 'ArrowRight' || event.key === 'PageDown' || event.key === ' ') {
+      event.preventDefault();
+      void turnPage(1);
+    }
+  };
+  iframe.addEventListener('load', () => {
+    const doc = iframe.contentDocument;
+    if (doc && !doc.__recollReaderKeybound) {
+      doc.addEventListener('keydown', handleKeydown);
+      doc.__recollReaderKeybound = true;
+    }
+  });
+  const doc = iframe.contentDocument;
+  if (doc && !doc.__recollReaderKeybound) {
+    doc.addEventListener('keydown', handleKeydown);
+    doc.__recollReaderKeybound = true;
+  }
+  iframe.dataset.readerBound = 'yes';
+};
+
 const fetchJson = async (url) => {
   const res = await fetch(url, { credentials: 'same-origin' });
   if (!res.ok) {
@@ -117,6 +188,7 @@ const openIndex = async (index) => {
   updateMeta();
   renderSidebar();
   cleanupRendition();
+  updatePageButtons();
   setLoading(`正在打开 ${item.name || item.title || ''}`);
   try {
     const response = await fetch(item.url, { credentials: 'same-origin' });
@@ -140,7 +212,7 @@ const openIndex = async (index) => {
       isConvertPDF: 'no',
       ocrLang: '',
       ocrEngine: 'paddle',
-      isAllowScript: 'no',
+      isAllowScript: 'yes',
       isBionic: 'no',
       isIndent: 'no',
       isHyphenation: 'no',
@@ -151,12 +223,14 @@ const openIndex = async (index) => {
     const rendition = window.BookHelper.getRendition(buffer, options, Kookit);
     state.rendition = rendition;
     window.rendition = rendition;
+    updatePageButtons();
     const savedPosition = item.format === 'txt' ? loadPosition(item) : null;
-    if (savedPosition) {
-      await rendition.renderTo(stage, savedPosition);
-    } else {
-      await rendition.renderTo(stage);
-      if (item.format === 'txt') {
+    await rendition.renderTo(stage);
+    bindIframeNavigation();
+    if (item.format === 'txt') {
+      if (isValidTxtPosition(savedPosition) && typeof rendition.goToPosition === 'function') {
+        await rendition.goToPosition(JSON.stringify(savedPosition));
+      } else if (typeof rendition.goToPosition === 'function') {
         await rendition.goToPosition(JSON.stringify({
           text: '',
           chapterTitle: '',
@@ -177,7 +251,7 @@ const openIndex = async (index) => {
         const progress = await rendition.getProgress();
         const position = rendition.getPosition ? rendition.getPosition() : {};
         progressBadge.textContent = progress && typeof progress.percentage !== 'undefined' ? `${Math.round(progress.percentage * 100)}%` : '阅读中';
-        savePosition(item, { ...position, progress });
+        savePosition(item, Object.assign({}, position || {}, { progress }));
         if (state.folderMeta) {
           saveFolderCursor(state.folderMeta);
         }
@@ -189,7 +263,7 @@ const openIndex = async (index) => {
     await updateProgress();
   } catch (err) {
     console.error(err);
-    setError(err?.message || '打开阅读器失败');
+    setError((err && err.message) || '打开阅读器失败');
   }
 };
 
@@ -209,7 +283,9 @@ const loadFolderMode = async () => {
   state.folderMeta = data;
   state.items = data.items || [];
   const saved = JSON.parse(localStorage.getItem('recoll-reader:folder') || 'null');
-  state.currentIndex = typeof saved?.currentIndex === 'number' ? Math.min(saved.currentIndex, Math.max(0, state.items.length - 1)) : (data.currentIndex || 0);
+  state.currentIndex = saved && typeof saved.currentIndex === 'number'
+    ? Math.min(saved.currentIndex, Math.max(0, state.items.length - 1))
+    : (data.currentIndex || 0);
   state.current = state.items[state.currentIndex] || state.items[0] || null;
   renderSidebar();
   updateMeta();
@@ -231,30 +307,49 @@ el('reader-next-book').addEventListener('click', () => {
   if (state.items.length > 1) openIndex(state.currentIndex + 1);
 });
 
+prevPageButton.addEventListener('click', () => {
+  void turnPage(-1);
+});
+
+nextPageButton.addEventListener('click', () => {
+  void turnPage(1);
+});
+
 el('reader-save-regex').addEventListener('click', () => {
   state.parserRegex = parserInput.value.trim();
   localStorage.setItem('recoll-reader:parserRegex', state.parserRegex);
   if (state.current && state.current.format === 'txt') {
-    openIndex(state.currentIndex);
+    void openIndex(state.currentIndex);
   }
 });
 
 window.addEventListener('beforeunload', () => {
   if (state.current) {
-    const position = state.rendition?.getPosition ? state.rendition.getPosition() : {};
+    const position = state.rendition && state.rendition.getPosition ? state.rendition.getPosition() : {};
     savePosition(state.current, position);
   }
   if (state.folderMeta) saveFolderCursor(state.folderMeta);
+});
+
+window.addEventListener('keydown', (event) => {
+  if (!shouldHandleStageKey(event)) return;
+  if (event.key === 'ArrowLeft' || event.key === 'PageUp') {
+    event.preventDefault();
+    void turnPage(-1);
+  } else if (event.key === 'ArrowRight' || event.key === 'PageDown') {
+    event.preventDefault();
+    void turnPage(1);
+  }
 });
 
 (async () => {
   try {
     if (!window.BookHelper) {
       const mod = await import('/static/reader/kookit.bundle.js');
-      const exported = mod?.default || mod;
+      const exported = mod && mod.default ? mod.default : mod;
       window.Kookit = window.Kookit && Object.keys(window.Kookit).length ? window.Kookit : exported;
-      window.BookHelper = window.BookHelper || exported?.BookHelper;
-      window.StyleHelper = window.StyleHelper || exported?.StyleHelper;
+      window.BookHelper = window.BookHelper || (exported && exported.BookHelper);
+      window.StyleHelper = window.StyleHelper || (exported && exported.StyleHelper);
     }
     if (!window.BookHelper) {
       throw new Error('Koodo reader runtime failed to initialize');
@@ -266,6 +361,8 @@ window.addEventListener('beforeunload', () => {
     }
   } catch (err) {
     console.error(err);
-    setError(err?.message || '初始化阅读器失败');
+    setError((err && err.message) || '初始化阅读器失败');
   }
 })();
+
+updatePageButtons();

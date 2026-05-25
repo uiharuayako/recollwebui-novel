@@ -2,7 +2,9 @@
 <div id="reader-app" class="reader-shell" data-mode="{{mode}}" data-query="{{query_string}}">
   <div class="reader-toolbar">
     <div class="reader-toolbar-left">
-      <a class="reader-button" href="./results?{{query_string}}">返回结果</a>
+      <a class="reader-button" href="./results?{{results_query_string}}">返回结果</a>
+      <button class="reader-button" id="reader-prev-page" type="button">上一页</button>
+      <button class="reader-button" id="reader-next-page" type="button">下一页</button>
       <button class="reader-button" id="reader-prev-book" type="button">上一册</button>
       <button class="reader-button" id="reader-next-book" type="button">下一册</button>
     </div>
@@ -33,6 +35,7 @@
 window.RECOLL_READER = {
   mode: "{{mode}}",
   queryString: "{{query_string}}",
+  resultsQueryString: "{{results_query_string}}",
 };
 </script>
 <script type="module" src="/static/reader/kookit.bundle.js"></script>
