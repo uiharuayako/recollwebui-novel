@@ -1,5 +1,6 @@
 #{{{ imports
 import os
+import re
 import bottle
 import time
 import sys
@@ -10,9 +11,16 @@ import hmac
 import base64
 import csv
 import io
+import mimetypes
 import string
+import subprocess
+import tempfile
 import shlex
-from urllib.parse import parse_qsl, urlencode, quote as urlquote, unquote as urlunquote
+import posixpath
+import zipfile
+import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
+from urllib.parse import parse_qsl, urlencode, quote as urlquote, unquote as urlunquote, urlsplit
 from recoll import recoll, rclextract, rclconfig
 
 def msg(s):
@@ -69,6 +77,7 @@ READER_SUPPORTED_FORMATS = {
     "azw",
     "azw3",
     "fb2",
+    "chm",
     "docx",
     "md",
     "html",
@@ -88,6 +97,8 @@ READER_TOKEN_TTL = 60 * 60 * 12
 READER_TOKEN_SECRET = os.environ.get("RECOLL_READER_TOKEN_SECRET")
 if not READER_TOKEN_SECRET:
     READER_TOKEN_SECRET = base64.urlsafe_b64encode(os.urandom(32)).decode("ascii")
+READER_CHM_CACHE_ROOT = os.path.join(g_tmpdir or tempfile.gettempdir(), "recoll-webui-reader", "chm")
+READER_EPUB_CACHE_ROOT = os.path.join(g_tmpdir or tempfile.gettempdir(), "recoll-webui-reader", "epub")
 
 # sort fields/labels
 SORTS = [
@@ -180,6 +191,620 @@ def normalize_file_path(path):
         path = path[len("file://") :]
     return os.path.realpath(path)
 
+def normalize_reader_relpath(path):
+    if not path:
+        return ""
+    parsed = urlsplit(str(path).strip().replace("\\", "/"))
+    relpath = urlunquote(parsed.path or "").lstrip("/")
+    parts = [part for part in relpath.split("/") if part not in ("", ".")]
+    normalized = []
+    for part in parts:
+        if part == "..":
+            if normalized:
+                normalized.pop()
+            continue
+        normalized.append(part)
+    relpath = "/".join(normalized)
+    if parsed.query:
+        relpath = f"{relpath}?{parsed.query}"
+    if parsed.fragment:
+        relpath = f"{relpath}#{parsed.fragment}"
+    return relpath
+
+def split_reader_relpath(path):
+    normalized = normalize_reader_relpath(path)
+    parsed = urlsplit(normalized)
+    relpath = (parsed.path or "").lstrip("/")
+    return relpath, parsed.query or "", parsed.fragment or ""
+
+def build_reader_content_url(prefix, relpath=""):
+    clean_relpath, query, fragment = split_reader_relpath(relpath)
+    url = prefix.rstrip("/")
+    if clean_relpath:
+        url = f"{url}/{urlquote(clean_relpath, safe='/')}"
+    else:
+        url = f"{url}/"
+    if query:
+        url = f"{url}?{query}"
+    if fragment:
+        fragment_safe = "-._~!$&'()*+,;=:@/?"
+        url = f"{url}#{urlquote(fragment, safe=fragment_safe)}"
+    return url
+
+class ChmTocParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.depth = 0
+        self.current = None
+        self.items = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = {key.lower(): value for key, value in attrs}
+        tag = tag.lower()
+        if tag == "ul":
+            self.depth += 1
+            return
+        if tag == "object" and attrs.get("type", "").lower() == "text/sitemap":
+            self.current = {}
+            return
+        if tag == "param" and self.current is not None:
+            name = (attrs.get("name") or "").strip().lower()
+            value = (attrs.get("value") or "").strip()
+            if name and value:
+                self.current[name] = value
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag == "object" and self.current is not None:
+            label = self.current.get("name", "").strip()
+            href = normalize_reader_relpath(self.current.get("local", ""))
+            if label or href:
+                if not label:
+                    label = os.path.splitext(os.path.basename(urlsplit(href).path or ""))[0] or "Untitled"
+                self.items.append({
+                    "label": label,
+                    "href": href,
+                    "depth": max(0, self.depth - 1),
+                })
+            self.current = None
+            return
+        if tag == "ul" and self.depth > 0:
+            self.depth -= 1
+
+def parse_chm_hhp(path):
+    metadata = {}
+    in_options = False
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line or line.startswith(";"):
+                    continue
+                if line.startswith("[") and line.endswith("]"):
+                    in_options = line.strip().lower() == "[options]"
+                    continue
+                if not in_options or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip().lower()
+                value = value.strip()
+                if key == "default topic":
+                    metadata["default_topic"] = normalize_reader_relpath(value)
+                elif key == "contents file":
+                    metadata["contents_file"] = normalize_reader_relpath(value)
+                elif key == "title":
+                    metadata["title"] = value
+    except OSError:
+        return metadata
+    return metadata
+
+def parse_chm_toc(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+            data = handle.read()
+    except OSError:
+        return []
+    parser = ChmTocParser()
+    parser.feed(data)
+    return [item for item in parser.items if item.get("href")]
+
+def build_epub_cache_key(path):
+    st = os.stat(path)
+    payload = json.dumps(
+        {
+            "path": os.path.realpath(path),
+            "mtime_ns": getattr(st, "st_mtime_ns", int(st.st_mtime * 1000000000)),
+            "size": st.st_size,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+def get_epub_cache_paths(path):
+    cache_key = build_epub_cache_key(path)
+    root = os.path.join(READER_EPUB_CACHE_ROOT, cache_key)
+    return {
+        "key": cache_key,
+        "root": root,
+        "manifest_path": os.path.join(root, "manifest.json"),
+    }
+
+def xml_local_name(tag):
+    if not tag:
+        return ""
+    if "}" in tag:
+        return tag.rsplit("}", 1)[1]
+    return tag
+
+def epub_href_to_path(base_dir, href):
+    href = (href or "").strip()
+    if not href:
+        return ""
+    parts = urlsplit(href)
+    if parts.scheme or parts.netloc:
+        return ""
+    relpath = parts.path or ""
+    if not relpath:
+        return ""
+    joined = posixpath.normpath(posixpath.join(base_dir or "", relpath))
+    if joined.startswith("../") or joined == "..":
+        return ""
+    if joined.startswith("./"):
+        joined = joined[2:]
+    if parts.query:
+        joined = f"{joined}?{parts.query}"
+    if parts.fragment:
+        joined = f"{joined}#{parts.fragment}"
+    return joined.lstrip("/")
+
+def epub_href_to_zip_member(base_dir, href):
+    href = (href or "").strip()
+    if not href:
+        return ""
+    parts = urlsplit(href)
+    if parts.scheme or parts.netloc:
+        return ""
+    relpath = parts.path or ""
+    if not relpath:
+        return ""
+    joined = posixpath.normpath(posixpath.join(base_dir or "", relpath))
+    if joined.startswith("../") or joined == "..":
+        return ""
+    return joined.lstrip("/")
+
+def parse_epub_nav_items(container):
+    items = []
+    if container is None:
+        return items
+    for li in [child for child in list(container) if xml_local_name(child.tag).lower() == "li"]:
+        label = ""
+        href = ""
+        for child in list(li):
+            tag = xml_local_name(child.tag).lower()
+            if tag == "a":
+                label = " ".join("".join(child.itertext()).split())
+                href = (child.get("href") or "").strip()
+                if href:
+                    break
+        subitems = []
+        for child in list(li):
+            if xml_local_name(child.tag).lower() == "ol":
+                subitems = parse_epub_nav_items(child)
+                break
+        if label or href:
+            items.append({
+                "label": label or os.path.splitext(os.path.basename(urlsplit(href).path or ""))[0] or "Untitled",
+                "href": href,
+                "subitems": subitems,
+            })
+    return items
+
+def parse_epub_nav_toc(opf_dir, nav_member_name, zipf):
+    if not nav_member_name:
+        return []
+    try:
+        with zipf.open(nav_member_name) as handle:
+            root = ET.parse(handle).getroot()
+    except Exception:
+        return []
+    nav_candidates = []
+    for elem in root.iter():
+        if xml_local_name(elem.tag).lower() != "nav":
+            continue
+        epub_type = (elem.get("{http://www.idpf.org/2007/ops}type") or elem.get("epub:type") or elem.get("type") or "").lower()
+        role = (elem.get("role") or "").lower()
+        nav_candidates.append((("toc" in epub_type) or ("doc-toc" in epub_type) or (role == "doc-toc"), elem))
+    selected = None
+    for is_toc, elem in nav_candidates:
+        if is_toc:
+            selected = elem
+            break
+    if selected is None and nav_candidates:
+        selected = nav_candidates[0][1]
+    if selected is None:
+        return []
+    ol = None
+    for child in list(selected):
+        if xml_local_name(child.tag).lower() == "ol":
+            ol = child
+            break
+    if ol is None:
+        for child in selected.iter():
+            if xml_local_name(child.tag).lower() == "ol":
+                ol = child
+                break
+    if ol is None:
+        return []
+    items = parse_epub_nav_items(ol)
+    normalized = []
+    for item in items:
+        href = epub_href_to_path(opf_dir, item.get("href", ""))
+        if not href:
+            continue
+        normalized.append({
+            "label": item.get("label", "Untitled"),
+            "href": href,
+            "subitems": item.get("subitems", []),
+        })
+    return normalized
+
+def parse_epub_ncx_toc(opf_dir, ncx_member_name, zipf):
+    if not ncx_member_name:
+        return []
+    try:
+        with zipf.open(ncx_member_name) as handle:
+            root = ET.parse(handle).getroot()
+    except Exception:
+        return []
+    nav_map = None
+    for elem in root.iter():
+        if xml_local_name(elem.tag).lower() == "navmap":
+            nav_map = elem
+            break
+    if nav_map is None:
+        return []
+    def parse_navpoints(container):
+        out = []
+        for navpoint in [child for child in list(container) if xml_local_name(child.tag).lower() == "navpoint"]:
+            label = ""
+            content = None
+            for child in list(navpoint):
+                tag = xml_local_name(child.tag).lower()
+                if tag == "navlabel":
+                    label = " ".join("".join(child.itertext()).split())
+                elif tag == "content":
+                    content = child
+            href = epub_href_to_path(opf_dir, content.get("src", "") if content is not None else "")
+            if href:
+                out.append({
+                    "label": label or os.path.splitext(os.path.basename(urlsplit(href).path or ""))[0] or "Untitled",
+                    "href": href,
+                    "subitems": parse_navpoints(navpoint),
+                })
+        return out
+    return parse_navpoints(nav_map)
+
+def ensure_epub_cache(path):
+    paths = get_epub_cache_paths(path)
+    manifest_path = paths["manifest_path"]
+    if os.path.isfile(manifest_path):
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+
+    os.makedirs(READER_EPUB_CACHE_ROOT, exist_ok=True)
+    os.makedirs(paths["root"], exist_ok=True)
+    try:
+        with zipfile.ZipFile(path) as zipf:
+            namelist = zipf.namelist()
+            lower_names = {name.lower(): name for name in namelist}
+            container_name = lower_names.get("meta-inf/container.xml")
+            opf_name = ""
+            opf_dir = ""
+            if container_name:
+                with zipf.open(container_name) as handle:
+                    container_root = ET.parse(handle).getroot()
+                ns = {"c": "urn:oasis:names:tc:opendocument:xmlns:container"}
+                rootfile = container_root.find(".//c:rootfile", ns)
+                if rootfile is not None:
+                    opf_name = (rootfile.get("full-path") or "").strip()
+            if not opf_name:
+                opf_candidates = [name for name in namelist if name.lower().endswith(".opf")]
+                opf_candidates.sort(key=lambda item: item.lower())
+                if opf_candidates:
+                    opf_name = opf_candidates[0]
+            if not opf_name:
+                raise RuntimeError("EPUB package document not found")
+            opf_name = epub_href_to_zip_member("", opf_name)
+            opf_dir = posixpath.dirname(opf_name)
+            with zipf.open(opf_name) as handle:
+                opf_root = ET.parse(handle).getroot()
+            package_ns = opf_root.tag.split("}", 1)[0].strip("{") if "}" in opf_root.tag else ""
+            ns = {
+                "opf": package_ns or "http://www.idpf.org/2007/opf",
+                "dc": "http://purl.org/dc/elements/1.1/",
+            }
+            manifest_items = {}
+            nav_member = ""
+            ncx_member = ""
+            for item in opf_root.findall(".//opf:manifest/opf:item", ns):
+                item_id = (item.get("id") or "").strip()
+                href = (item.get("href") or "").strip()
+                media_type = (item.get("media-type") or "").strip()
+                properties = (item.get("properties") or "").strip()
+                resolved = epub_href_to_zip_member(opf_dir, href)
+                manifest_items[item_id] = {
+                    "id": item_id,
+                    "href": resolved,
+                    "mediaType": media_type,
+                    "properties": properties,
+                }
+                if "nav" in properties.split():
+                    nav_member = resolved
+                if media_type == "application/x-dtbncx+xml":
+                    ncx_member = resolved
+            spine = opf_root.find(".//opf:spine", ns)
+            spine_items = []
+            if spine is not None:
+                toc_id = (spine.get("toc") or "").strip()
+                if toc_id and toc_id in manifest_items and not ncx_member:
+                    ncx_member = manifest_items[toc_id]["href"]
+                for itemref in spine.findall("opf:itemref", ns):
+                    idref = (itemref.get("idref") or "").strip()
+                    manifest_item = manifest_items.get(idref)
+                    if not manifest_item:
+                        continue
+                    href = manifest_item.get("href", "")
+                    if not href:
+                        continue
+                    spine_items.append(manifest_item)
+            toc_items = parse_epub_nav_toc(opf_dir, nav_member, zipf)
+            if not toc_items:
+                toc_items = parse_epub_ncx_toc(opf_dir, ncx_member, zipf)
+            toc_index_by_href = {}
+            def flatten_toc(items):
+                out = []
+                for item in items or []:
+                    href = normalize_reader_relpath(item.get("href", ""))
+                    if href and href not in toc_index_by_href:
+                        toc_index_by_href[href] = item.get("label", "")
+                    out.append(item)
+                    out.extend(flatten_toc(item.get("subitems", [])))
+                return out
+            flatten_toc(toc_items)
+            chapters = []
+            for index, manifest_item in enumerate(spine_items):
+                href = normalize_reader_relpath(manifest_item.get("href", ""))
+                if not href:
+                    continue
+                label = toc_index_by_href.get(href) or os.path.splitext(os.path.basename(urlsplit(href).path or ""))[0] or f"第 {index + 1} 章"
+                zip_member = epub_href_to_zip_member("", href)
+                size = 0
+                try:
+                    size = zipf.getinfo(zip_member).file_size
+                except Exception:
+                    size = 0
+                chapters.append({
+                    "label": label,
+                    "href": href,
+                    "size": size,
+                    "mediaType": manifest_item.get("mediaType", ""),
+                })
+            title = ""
+            for child in opf_root.iter():
+                if xml_local_name(child.tag).lower() == "title":
+                    title = " ".join("".join(child.itertext()).split())
+                    if title:
+                        break
+            if not title:
+                title = os.path.splitext(os.path.basename(path))[0]
+            manifest = {
+                "cacheKey": paths["key"],
+                "sourcePath": os.path.realpath(path),
+                "title": title,
+                "start_path": chapters[0]["href"] if chapters else "",
+                "toc": toc_items,
+                "chapters": chapters,
+                "count": len(chapters),
+            }
+            with open(manifest_path, "w", encoding="utf-8") as handle:
+                json.dump(manifest, handle, ensure_ascii=False, indent=2)
+            return manifest
+    except Exception:
+        raise
+
+def build_chm_cache_key(path):
+    st = os.stat(path)
+    payload = json.dumps(
+        {
+            "path": os.path.realpath(path),
+            "mtime_ns": getattr(st, "st_mtime_ns", int(st.st_mtime * 1000000000)),
+            "size": st.st_size,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+def get_chm_cache_paths(path):
+    cache_key = build_chm_cache_key(path)
+    root = os.path.join(READER_CHM_CACHE_ROOT, cache_key)
+    return {
+        "key": cache_key,
+        "root": root,
+        "files_root": os.path.join(root, "files"),
+        "manifest_path": os.path.join(root, "manifest.json"),
+    }
+
+def remove_tree(path):
+    if not os.path.isdir(path):
+        return
+    for dirpath, dirnames, filenames in os.walk(path, topdown=False):
+        for filename in filenames:
+            os.unlink(os.path.join(dirpath, filename))
+        for dirname in dirnames:
+            os.rmdir(os.path.join(dirpath, dirname))
+    os.rmdir(path)
+
+def resolve_existing_reader_path(root, relpath):
+    clean_path, _, _ = split_reader_relpath(relpath)
+    if not clean_path:
+        return ""
+    exact_path = os.path.join(root, clean_path.replace("/", os.sep))
+    if os.path.exists(exact_path):
+        return clean_path
+    target = clean_path.lower()
+    for dirpath, _, filenames in os.walk(root):
+        for filename in filenames:
+            rel = os.path.relpath(os.path.join(dirpath, filename), root).replace(os.sep, "/")
+            if rel.lower() == target:
+                return rel
+    return ""
+
+def find_chm_start_path(files_root, manifest):
+    default_topic = resolve_existing_reader_path(files_root, manifest.get("default_topic", ""))
+    if default_topic:
+        return default_topic
+
+    toc = manifest.get("toc", [])
+    if toc:
+        toc_path = resolve_existing_reader_path(files_root, toc[0].get("href", ""))
+        if toc_path:
+            return toc_path
+
+    preferred = ("index.html", "index.htm", "default.html", "default.htm", "start.html", "start.htm")
+    for candidate in preferred:
+        resolved = resolve_existing_reader_path(files_root, candidate)
+        if resolved:
+            return resolved
+
+    html_candidates = []
+    for dirpath, _, filenames in os.walk(files_root):
+        for filename in filenames:
+            ext = os.path.splitext(filename)[1].lower()
+            if ext in (".html", ".htm", ".xhtml"):
+                rel = os.path.relpath(os.path.join(dirpath, filename), files_root).replace(os.sep, "/")
+                html_candidates.append(rel)
+    html_candidates.sort(key=lambda item: item.lower())
+    return html_candidates[0] if html_candidates else ""
+
+def ensure_chm_cache(path):
+    paths = get_chm_cache_paths(path)
+    manifest_path = paths["manifest_path"]
+    if os.path.isfile(manifest_path):
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+
+    os.makedirs(READER_CHM_CACHE_ROOT, exist_ok=True)
+    tmp_root = f"{paths['root']}.tmp-{os.getpid()}-{int(time.time() * 1000)}"
+    files_root = os.path.join(tmp_root, "files")
+    os.makedirs(files_root, exist_ok=True)
+    try:
+        result = subprocess.run(
+            ["7z", "x", "-y", f"-o{files_root}", path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stdout.strip() or "7z extraction failed")
+
+        manifest = {
+            "cacheKey": paths["key"],
+            "sourcePath": os.path.realpath(path),
+            "title": "",
+            "default_topic": "",
+            "contents_file": "",
+            "toc": [],
+            "start_path": "",
+        }
+        hhp_files = []
+        hhc_files = []
+        for dirpath, _, filenames in os.walk(files_root):
+            for filename in filenames:
+                lower = filename.lower()
+                rel = os.path.relpath(os.path.join(dirpath, filename), files_root).replace(os.sep, "/")
+                if lower.endswith(".hhp"):
+                    hhp_files.append(rel)
+                elif lower.endswith(".hhc"):
+                    hhc_files.append(rel)
+
+        hhp_files.sort(key=lambda item: item.lower())
+        hhc_files.sort(key=lambda item: item.lower())
+
+        for rel in hhp_files:
+            metadata = parse_chm_hhp(os.path.join(files_root, rel.replace("/", os.sep)))
+            if metadata.get("title") and not manifest["title"]:
+                manifest["title"] = metadata["title"]
+            if metadata.get("default_topic") and not manifest["default_topic"]:
+                manifest["default_topic"] = metadata["default_topic"]
+            if metadata.get("contents_file") and not manifest["contents_file"]:
+                manifest["contents_file"] = metadata["contents_file"]
+            if manifest["default_topic"] and manifest["contents_file"]:
+                break
+
+        toc_candidates = []
+        if manifest["contents_file"]:
+            toc_candidates.append(manifest["contents_file"])
+        toc_candidates.extend(hhc_files)
+        seen = set()
+        for rel in toc_candidates:
+            resolved = resolve_existing_reader_path(files_root, rel)
+            if not resolved or resolved in seen:
+                continue
+            seen.add(resolved)
+            toc = parse_chm_toc(os.path.join(files_root, resolved.replace("/", os.sep)))
+            if toc:
+                manifest["toc"] = toc
+                break
+
+        manifest["start_path"] = find_chm_start_path(files_root, manifest)
+        if not manifest["title"]:
+            manifest["title"] = os.path.splitext(os.path.basename(path))[0]
+        if not manifest["start_path"]:
+            raise RuntimeError("No HTML entry point found in CHM archive")
+
+        if os.path.isdir(paths["root"]):
+            if os.path.isfile(manifest_path):
+                with open(manifest_path, "r", encoding="utf-8") as handle:
+                    return json.load(handle)
+            remove_tree(paths["root"])
+        os.replace(tmp_root, paths["root"])
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, ensure_ascii=False, indent=2)
+        return manifest
+    except Exception:
+        try:
+            remove_tree(tmp_root)
+        except OSError:
+            pass
+        raise
+
+def get_reader_chm_content_root(path):
+    cache_paths = get_chm_cache_paths(path)
+    manifest = ensure_chm_cache(path)
+    return cache_paths["files_root"], manifest
+
+def resolve_chm_content_file(root, manifest, relpath=""):
+    requested = relpath or manifest.get("start_path", "")
+    clean_path = resolve_existing_reader_path(root, requested) if requested else manifest.get("start_path", "")
+    if not clean_path:
+        return "", ""
+    real_path = os.path.realpath(os.path.join(root, clean_path.replace("/", os.sep)))
+    if not real_path.startswith(os.path.realpath(root) + os.sep) and real_path != os.path.realpath(root):
+        return "", ""
+    if os.path.isdir(real_path):
+        for candidate in ("index.html", "index.htm", "default.html", "default.htm"):
+            nested = resolve_existing_reader_path(root, f"{clean_path.rstrip('/')}/{candidate}")
+            if nested:
+                clean_path = nested
+                real_path = os.path.realpath(os.path.join(root, clean_path.replace("/", os.sep)))
+                break
+    if not os.path.isfile(real_path):
+        return "", ""
+    return real_path, clean_path
+
 def get_reader_format_from_name(name, mtype=""):
     ext = os.path.splitext(name or "")[1].lower().lstrip(".")
     if ext in READER_SUPPORTED_FORMATS:
@@ -195,6 +820,8 @@ def get_reader_format_from_name(name, mtype=""):
         "application/epub+zip": "epub",
         "application/x-fictionbook+xml": "fb2",
         "application/fb2+xml": "fb2",
+        "application/vnd.ms-htmlhelp": "chm",
+        "application/x-chm": "chm",
         "application/vnd.amazon.ebook": "azw3",
         "application/x-mobipocket-ebook": "mobi",
         "application/x-cbz": "cbz",
@@ -307,7 +934,7 @@ def build_reader_item(doc, config, path):
     name = get_doc_display_name(doc)
     reader_format = get_reader_format_from_name(name, getattr(doc, "mtype", ""))
     token = make_reader_token(path, getattr(doc, "mtype", ""), name)
-    return {
+    item = {
         "name": name,
         "title": select([getattr(doc, "title", ""), name, "?"], [None, ""]),
         "author": getattr(doc, "author", "") or "",
@@ -319,6 +946,11 @@ def build_reader_item(doc, config, path):
         "url": f"/api/reader/file/{urlquote(token)}",
         "supported": reader_format in READER_SUPPORTED_FORMATS,
     }
+    if reader_format == "chm":
+        item["manifestUrl"] = f"/api/reader/chm/{urlquote(token)}/manifest"
+    elif reader_format == "epub":
+        item["manifestUrl"] = f"/api/reader/epub/{urlquote(token)}/manifest"
+    return item
 
 def scan_reader_folder(current_doc, config):
     current_path = get_reader_path_for_doc(current_doc, config)
@@ -359,6 +991,10 @@ def scan_reader_folder(current_doc, config):
                 "supported": True,
             }
             item["url"] = f"/api/reader/file/{urlquote(item['token'])}"
+            if reader_format == "chm":
+                item["manifestUrl"] = f"/api/reader/chm/{urlquote(item['token'])}/manifest"
+            elif reader_format == "epub":
+                item["manifestUrl"] = f"/api/reader/epub/{urlquote(item['token'])}/manifest"
             if path == current_path:
                 current_item = item
             items.append(item)
@@ -389,6 +1025,10 @@ def scan_reader_folder(current_doc, config):
                 "supported": True,
             }
             current_item["url"] = f"/api/reader/file/{urlquote(current_item['token'])}"
+            if current_format == "chm":
+                current_item["manifestUrl"] = f"/api/reader/chm/{urlquote(current_item['token'])}/manifest"
+            elif current_format == "epub":
+                current_item["manifestUrl"] = f"/api/reader/epub/{urlquote(current_item['token'])}/manifest"
             items.insert(0, current_item)
             current_index = 0
             if len(items) > READER_FOLDER_SCAN_LIMIT:
@@ -849,6 +1489,7 @@ def reader_file(token):
             "epub": "application/epub+zip",
             "pdf": "application/pdf",
             "fb2": "application/x-fictionbook+xml",
+            "chm": "application/vnd.ms-htmlhelp",
             "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "mobi": "application/x-mobipocket-ebook",
             "azw": "application/vnd.amazon.ebook",
@@ -864,6 +1505,231 @@ def reader_file(token):
     bottle.response.headers['Content-Length'] = os.stat(path).st_size
     with open(path, 'rb') as f:
         return f.read()
+#}}}
+#{{{ reader epub manifest api
+@bottle.route('/api/reader/epub/<token>/manifest')
+def reader_epub_manifest(token):
+    payload = read_reader_token(token)
+    if not payload:
+        bottle.abort(403, "Invalid or expired reader token")
+    config = get_config()
+    path = payload["path"]
+    if not is_allowed_reader_path(path, config):
+        bottle.abort(403, "Reader access denied")
+    if not os.path.isfile(path):
+        bottle.abort(404, "Reader file not found")
+    if get_reader_format_from_name(payload.get("name") or path, payload.get("mimetype", "")) != "epub":
+        bottle.abort(400, "Not an EPUB document")
+
+    manifest = ensure_epub_cache(path)
+    content_prefix = f"/api/reader/epub/{urlquote(token)}/content"
+    chapters = [
+        {
+            "label": item.get("label", "Untitled"),
+            "href": item.get("href", ""),
+            "url": build_reader_content_url(content_prefix, item.get("href", "")),
+            "size": int(item.get("size", 0) or 0),
+            "mediaType": item.get("mediaType", ""),
+        }
+        for item in manifest.get("chapters", [])
+        if item.get("href")
+    ]
+    bottle.response.content_type = 'application/json; charset=utf-8'
+    return json.dumps(
+        {
+            "title": manifest.get("title") or os.path.splitext(os.path.basename(path))[0],
+            "startPath": manifest.get("start_path", ""),
+            "startUrl": build_reader_content_url(content_prefix, manifest.get("start_path", "")),
+            "contentBaseUrl": f"{content_prefix}/",
+            "toc": manifest.get("toc", []),
+            "chapters": chapters,
+            "count": len(chapters),
+        },
+        ensure_ascii=False,
+    )
+#}}}
+#{{{ reader epub content api
+@bottle.route('/api/reader/epub/<token>/content')
+@bottle.route('/api/reader/epub/<token>/content/<relpath:path>')
+def reader_epub_content(token, relpath=""):
+    payload = read_reader_token(token)
+    if not payload:
+        bottle.abort(403, "Invalid or expired reader token")
+    config = get_config()
+    path = payload["path"]
+    if not is_allowed_reader_path(path, config):
+        bottle.abort(403, "Reader access denied")
+    if not os.path.isfile(path):
+        bottle.abort(404, "Reader file not found")
+    if get_reader_format_from_name(payload.get("name") or path, payload.get("mimetype", "")) != "epub":
+        bottle.abort(400, "Not an EPUB document")
+
+    manifest = ensure_epub_cache(path)
+    requested = normalize_reader_relpath(relpath) or normalize_reader_relpath(manifest.get("start_path", ""))
+    member_name = epub_href_to_zip_member("", requested)
+    if not member_name:
+        bottle.abort(404, "EPUB entry not found")
+    try:
+        with zipfile.ZipFile(path) as zipf:
+            if member_name not in zipf.namelist():
+                lower_map = {name.lower(): name for name in zipf.namelist()}
+                member_name = lower_map.get(member_name.lower(), "")
+            if not member_name:
+                bottle.abort(404, "EPUB entry not found")
+            raw = zipf.read(member_name)
+    except KeyError:
+        bottle.abort(404, "EPUB entry not found")
+
+    mimetype, encoding = mimetypes.guess_type(member_name)
+    ext = os.path.splitext(member_name)[1].lower()
+    if ext in (".html", ".htm", ".xhtml"):
+        mimetype = "text/html"
+    elif ext == ".css":
+        mimetype = "text/css"
+    elif ext == ".js":
+        mimetype = "application/javascript"
+    elif ext == ".svg":
+        mimetype = "image/svg+xml"
+    bottle.response.content_type = mimetype or "application/octet-stream"
+    if encoding:
+        bottle.response.content_type = f"{mimetype}; charset={encoding}"
+    bottle.response.headers['Cache-Control'] = 'private, max-age=3600'
+    bottle.response.headers['Content-Length'] = len(raw)
+    return raw
+#}}}
+#{{{ reader chm manifest api
+@bottle.route('/api/reader/chm/<token>/manifest')
+def reader_chm_manifest(token):
+    payload = read_reader_token(token)
+    if not payload:
+        bottle.abort(403, "Invalid or expired reader token")
+    config = get_config()
+    path = payload["path"]
+    if not is_allowed_reader_path(path, config):
+        bottle.abort(403, "Reader access denied")
+    if not os.path.isfile(path):
+        bottle.abort(404, "Reader file not found")
+    if get_reader_format_from_name(payload.get("name") or path, payload.get("mimetype", "")) != "chm":
+        bottle.abort(400, "Not a CHM document")
+
+    files_root, manifest = get_reader_chm_content_root(path)
+    content_prefix = f"/api/reader/chm/{urlquote(token)}/content"
+    toc = [
+        {
+            "label": item.get("label", "Untitled"),
+            "href": item.get("href", ""),
+            "depth": int(item.get("depth", 0) or 0),
+            "url": build_reader_content_url(content_prefix, item.get("href", "")),
+        }
+        for item in manifest.get("toc", [])
+        if item.get("href")
+    ]
+    title = manifest.get("title") or os.path.splitext(os.path.basename(path))[0]
+    bottle.response.content_type = 'application/json; charset=utf-8'
+    return json.dumps(
+        {
+            "title": title,
+            "startPath": manifest.get("start_path", ""),
+            "startUrl": build_reader_content_url(content_prefix, manifest.get("start_path", "")),
+            "contentBaseUrl": f"{content_prefix}/",
+            "toc": toc,
+            "count": len(toc),
+        },
+        ensure_ascii=False,
+    )
+#}}}
+def rewrite_chm_html_urls(raw_bytes, token):
+    """Rewrite absolute paths in CHM HTML content to route through the API.
+    Operates at byte level to preserve the original encoding of the file."""
+    prefix_bytes = f'/api/reader/chm/{urlquote(token)}/content'.encode('utf-8')
+
+    def replace_url(match):
+        return match.group(1) + b'=' + match.group(2) + prefix_bytes + match.group(3) + match.group(2)
+
+    return re.sub(
+        rb'(src|href|action)=("|\')(/[^"\'#][^"\']*?)\2',
+        replace_url,
+        raw_bytes,
+        flags=re.IGNORECASE,
+    )
+
+CHARSET_RE = re.compile(
+    rb'<meta[^>]+(?:charset=["\']?([^"\';>\s]+)|content=["\'][^"\']*charset=([^"\';>\s]+))',
+    re.IGNORECASE,
+)
+
+def detect_chm_html_mimetype(raw, fallback="text/html"):
+    """Detect charset from HTML meta tag and return Content-Type with charset."""
+    match = CHARSET_RE.search(raw)
+    charset = None
+    if match:
+        charset = (match.group(1) or match.group(2) or b"").decode('ascii', errors='ignore').strip()
+    if charset and charset.lower() in CHARSET_ALIASES:
+        charset = CHARSET_ALIASES[charset.lower()]
+    if charset and charset.isascii() and len(charset) < 32:
+        return f"{fallback}; charset={charset.lower()}"
+    return fallback
+
+CHARSET_ALIASES = {
+    "gb2312": "gbk",
+    "gb_2312": "gbk",
+    "gb-2312": "gbk",
+    "gb2312-80": "gbk",
+    "gbk": "gbk",
+    "gb18030": "gb18030",
+    "big5": "big5",
+    "big-5": "big5",
+    "shift_jis": "shift_jis",
+    "shift-jis": "shift_jis",
+    "euc-jp": "euc-jp",
+    "euc_kr": "euc-kr",
+    "euc-kr": "euc-kr",
+}
+
+#{{{ reader chm content api
+@bottle.route('/api/reader/chm/<token>/content')
+@bottle.route('/api/reader/chm/<token>/content/<relpath:path>')
+def reader_chm_content(token, relpath=""):
+    payload = read_reader_token(token)
+    if not payload:
+        bottle.abort(403, "Invalid or expired reader token")
+    config = get_config()
+    path = payload["path"]
+    if not is_allowed_reader_path(path, config):
+        bottle.abort(403, "Reader access denied")
+    if not os.path.isfile(path):
+        bottle.abort(404, "Reader file not found")
+    if get_reader_format_from_name(payload.get("name") or path, payload.get("mimetype", "")) != "chm":
+        bottle.abort(400, "Not a CHM document")
+
+    files_root, manifest = get_reader_chm_content_root(path)
+    file_path, resolved_relpath = resolve_chm_content_file(files_root, manifest, relpath)
+    if not file_path:
+        bottle.abort(404, "CHM entry not found")
+
+    mimetype, encoding = mimetypes.guess_type(file_path)
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in (".html", ".htm", ".hhc"):
+        mimetype = "text/html"
+    elif ext == ".css":
+        mimetype = "text/css"
+    elif ext == ".js":
+        mimetype = "application/javascript"
+    elif ext == ".svg":
+        mimetype = "image/svg+xml"
+    elif ext == ".xhtml":
+        mimetype = "application/xhtml+xml"
+    bottle.response.content_type = mimetype or "application/octet-stream"
+    bottle.response.headers['Cache-Control'] = 'private, max-age=3600'
+    bottle.response.headers['X-Reader-Path'] = resolved_relpath
+    with open(file_path, 'rb') as handle:
+        raw = handle.read()
+    if ext in (".html", ".htm", ".hhc", ".xhtml"):
+        raw = rewrite_chm_html_urls(raw, token)
+        mimetype = detect_chm_html_mimetype(raw, mimetype)
+        bottle.response.content_type = mimetype
+    bottle.response.headers['Content-Length'] = len(raw)
+    return raw
 #}}}
 #{{{ preview
 @bottle.route('/preview/<resnum:int>')

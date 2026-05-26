@@ -10,7 +10,7 @@
     <div class="search-result-number"><a href="#r{{d['sha']}}">#{{number}}</a></div>
     %url = d['url'].replace('file://', '')
     %reader_ext = os.path.splitext(d['filename'] or d['label'] or '')[1].lower().lstrip('.')
-    %reader_supported = reader_ext in ('txt', 'epub', 'mobi', 'azw', 'azw3', 'fb2', 'docx', 'md', 'html', 'htm', 'xhtml', 'xml', 'mhtml', 'pdf', 'cbz', 'cbr', 'cbt', 'cb7')
+    %reader_supported = reader_ext in ('txt', 'epub', 'mobi', 'azw', 'azw3', 'fb2', 'chm', 'docx', 'md', 'html', 'htm', 'xhtml', 'xml', 'mhtml', 'pdf', 'cbz', 'cbr', 'cbt', 'cb7') or (d.get('mtype') or '').lower() in ('application/vnd.ms-htmlhelp', 'application/x-chm')
     %for dr, prefix in config['mounts'].items():
         %url = url.replace(dr, prefix)
     %end
