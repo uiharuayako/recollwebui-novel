@@ -4,8 +4,27 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+secrets.json
+
+.tmp/
+debug-agent.log
 
 .DS_Store
+.idea/
+.vscode/
 \#*
 *~
 

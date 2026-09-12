@@ -21,9 +21,9 @@
         <output class="reader-font-value" id="reader-font-size" for="reader-font-decrease reader-font-increase">20px</output>
         <button class="reader-button reader-font-button" id="reader-font-increase" type="button" aria-label="增大阅读字号">A+</button>
       </div>
-      <label class="reader-label">TXT 规则</label>
-      <input class="reader-input" id="reader-parser-regex" placeholder="可选" />
-      <button class="reader-button" id="reader-save-regex" type="button">保存</button>
+      <label class="reader-label reader-txt-rule-hidden" hidden>TXT 规则</label>
+      <input class="reader-input reader-txt-rule-hidden" id="reader-parser-regex" placeholder="可选" hidden />
+      <button class="reader-button reader-txt-rule-hidden" id="reader-save-regex" type="button" hidden>保存</button>
     </div>
   </div>
   <button class="reader-toolbar-peek" id="reader-show-toolbar" type="button" aria-label="展开顶栏">展开</button>

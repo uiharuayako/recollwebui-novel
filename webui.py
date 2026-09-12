@@ -94,9 +94,11 @@ READER_SUPPORTED_FORMATS = {
 
 READER_FOLDER_SCAN_LIMIT = 1000
 READER_TOKEN_TTL = 60 * 60 * 12
+READER_TXT_CACHE_VERSION = 2
 READER_TOKEN_SECRET = os.environ.get("RECOLL_READER_TOKEN_SECRET")
 if not READER_TOKEN_SECRET:
     READER_TOKEN_SECRET = base64.urlsafe_b64encode(os.urandom(32)).decode("ascii")
+READER_TXT_CACHE_ROOT = os.path.join(g_tmpdir or tempfile.gettempdir(), "recoll-webui-reader", "txt")
 READER_CHM_CACHE_ROOT = os.path.join(g_tmpdir or tempfile.gettempdir(), "recoll-webui-reader", "chm")
 READER_EPUB_CACHE_ROOT = os.path.join(g_tmpdir or tempfile.gettempdir(), "recoll-webui-reader", "epub")
 
@@ -329,6 +331,122 @@ def get_epub_cache_paths(path):
         "root": root,
         "manifest_path": os.path.join(root, "manifest.json"),
     }
+
+def build_txt_cache_key(path):
+    st = os.stat(path)
+    payload = json.dumps(
+        {
+            "version": READER_TXT_CACHE_VERSION,
+            "path": os.path.realpath(path),
+            "mtime_ns": getattr(st, "st_mtime_ns", int(st.st_mtime * 1000000000)),
+            "size": st.st_size,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+def get_txt_cache_paths(path):
+    cache_key = build_txt_cache_key(path)
+    root = os.path.join(READER_TXT_CACHE_ROOT, cache_key)
+    return {
+        "key": cache_key,
+        "root": root,
+        "manifest_path": os.path.join(root, "manifest.json"),
+        "content_path": os.path.join(root, "content.bin"),
+    }
+
+def detect_txt_charset_bytes(raw):
+    if raw.startswith(b"\xff\xfe\x00\x00"):
+        return "utf-32-le"
+    if raw.startswith(b"\x00\x00\xfe\xff"):
+        return "utf-32-be"
+    if raw.startswith(b"\xff\xfe"):
+        return "utf-16-le"
+    if raw.startswith(b"\xfe\xff"):
+        return "utf-16-be"
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+    try:
+        raw.decode("utf-8", errors="strict")
+        return "utf-8"
+    except UnicodeDecodeError:
+        return "gb18030"
+
+def normalize_txt_bytes(raw):
+    charset = detect_txt_charset_bytes(raw)
+    text = raw.decode(charset, errors="replace")
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    return text.encode("utf-8"), "utf-8"
+
+def split_txt_chunks(raw_bytes):
+    target = 64 * 1024
+    soft = 48 * 1024
+    hard = 96 * 1024
+    chunks = []
+    start = 0
+    total = len(raw_bytes)
+    while start < total:
+        if start + target >= total:
+            end = total
+        else:
+            search_start = min(total, start + soft)
+            search_end = min(total, start + hard)
+            cut = -1
+            for idx in range(search_end - 1, search_start - 1, -1):
+                current = raw_bytes[idx:idx + 1]
+                if current not in (b"\n", b"\r"):
+                    continue
+                cut = idx + 1
+                if current == b"\r" and idx + 1 < total and raw_bytes[idx + 1:idx + 2] == b"\n":
+                    cut = idx + 2
+                break
+            end = cut if cut > start else min(total, start + hard)
+        while end < total and end > start and raw_bytes[end] & 0xC0 == 0x80:
+            end -= 1
+        if end <= start:
+            end = min(total, start + hard)
+        chunks.append({
+            "index": len(chunks),
+            "start": start,
+            "end": end,
+            "byteLength": max(0, end - start),
+        })
+        start = end
+    return chunks
+
+def ensure_txt_cache(path):
+    paths = get_txt_cache_paths(path)
+    manifest_path = paths["manifest_path"]
+    content_path = paths["content_path"]
+    if os.path.isfile(manifest_path) and os.path.isfile(content_path):
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        if manifest.get("path") == os.path.realpath(path):
+            return manifest
+
+    os.makedirs(READER_TXT_CACHE_ROOT, exist_ok=True)
+    os.makedirs(paths["root"], exist_ok=True)
+    with open(path, "rb") as handle:
+        raw = handle.read()
+    raw, charset = normalize_txt_bytes(raw)
+    chunks = split_txt_chunks(raw)
+    manifest = {
+        "path": os.path.realpath(path),
+        "size": os.path.getsize(path),
+        "mtime": int(os.path.getmtime(path)),
+        "charset": charset,
+        "chunkSizeTarget": 64 * 1024,
+        "chunkCount": len(chunks),
+        "estimatedCharsPerChunk": 64 * 1024,
+        "chunks": chunks,
+    }
+    with open(paths["content_path"], "wb") as handle:
+        handle.write(raw)
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, ensure_ascii=False, separators=(",", ":"))
+    return manifest
 
 def xml_local_name(tag):
     if not tag:
@@ -946,7 +1064,9 @@ def build_reader_item(doc, config, path):
         "url": f"/api/reader/file/{urlquote(token)}",
         "supported": reader_format in READER_SUPPORTED_FORMATS,
     }
-    if reader_format == "chm":
+    if reader_format == "txt":
+        item["manifestUrl"] = f"/api/reader/txt/{urlquote(token)}/manifest"
+    elif reader_format == "chm":
         item["manifestUrl"] = f"/api/reader/chm/{urlquote(token)}/manifest"
     elif reader_format == "epub":
         item["manifestUrl"] = f"/api/reader/epub/{urlquote(token)}/manifest"
@@ -991,7 +1111,9 @@ def scan_reader_folder(current_doc, config):
                 "supported": True,
             }
             item["url"] = f"/api/reader/file/{urlquote(item['token'])}"
-            if reader_format == "chm":
+            if reader_format == "txt":
+                item["manifestUrl"] = f"/api/reader/txt/{urlquote(item['token'])}/manifest"
+            elif reader_format == "chm":
                 item["manifestUrl"] = f"/api/reader/chm/{urlquote(item['token'])}/manifest"
             elif reader_format == "epub":
                 item["manifestUrl"] = f"/api/reader/epub/{urlquote(item['token'])}/manifest"
@@ -1025,7 +1147,9 @@ def scan_reader_folder(current_doc, config):
                 "supported": True,
             }
             current_item["url"] = f"/api/reader/file/{urlquote(current_item['token'])}"
-            if current_format == "chm":
+            if current_format == "txt":
+                current_item["manifestUrl"] = f"/api/reader/txt/{urlquote(current_item['token'])}/manifest"
+            elif current_format == "chm":
                 current_item["manifestUrl"] = f"/api/reader/chm/{urlquote(current_item['token'])}/manifest"
             elif current_format == "epub":
                 current_item["manifestUrl"] = f"/api/reader/epub/{urlquote(current_item['token'])}/manifest"
@@ -1505,6 +1629,90 @@ def reader_file(token):
     bottle.response.headers['Content-Length'] = os.stat(path).st_size
     with open(path, 'rb') as f:
         return f.read()
+#}}}
+#{{{ reader txt manifest api
+@bottle.route('/api/reader/txt/<token>/manifest')
+def reader_txt_manifest(token):
+    payload = read_reader_token(token)
+    if not payload:
+        bottle.abort(403, "Invalid or expired reader token")
+    config = get_config()
+    path = payload["path"]
+    if not is_allowed_reader_path(path, config):
+        bottle.abort(403, "Reader access denied")
+    if not os.path.isfile(path):
+        bottle.abort(404, "Reader file not found")
+    if get_reader_format_from_name(payload.get("name") or path, payload.get("mimetype", "")) != "txt":
+        bottle.abort(400, "Not a TXT document")
+
+    manifest = ensure_txt_cache(path)
+    paths = get_txt_cache_paths(path)
+    title = payload.get("name") or os.path.splitext(os.path.basename(path))[0]
+    chunks = [
+        {
+            "index": item["index"],
+            "start": item["start"],
+            "end": item["end"],
+            "byteLength": item["byteLength"],
+        }
+        for item in manifest.get("chunks", [])
+    ]
+    bottle.response.content_type = 'application/json; charset=utf-8'
+    return json.dumps(
+        {
+            "format": "txt",
+            "title": title,
+            "path": path,
+            "size": manifest.get("size", 0),
+            "charset": manifest.get("charset", "utf-8"),
+            "chunkCount": manifest.get("chunkCount", 0),
+            "chunkWindowMounted": 2,
+            "chunkWindowPrefetch": 4,
+            "estimatedCharsPerChunk": manifest.get("estimatedCharsPerChunk", 0),
+            "chunks": chunks,
+            "contentUrl": f"/api/reader/txt/{urlquote(token)}/chunk",
+            "cacheKey": paths["key"],
+        },
+        ensure_ascii=False,
+    )
+#}}}
+#{{{ reader txt chunk api
+@bottle.route('/api/reader/txt/<token>/chunk/<index:int>')
+def reader_txt_chunk(token, index):
+    payload = read_reader_token(token)
+    if not payload:
+        bottle.abort(403, "Invalid or expired reader token")
+    config = get_config()
+    path = payload["path"]
+    if not is_allowed_reader_path(path, config):
+        bottle.abort(403, "Reader access denied")
+    if not os.path.isfile(path):
+        bottle.abort(404, "Reader file not found")
+    if get_reader_format_from_name(payload.get("name") or path, payload.get("mimetype", "")) != "txt":
+        bottle.abort(400, "Not a TXT document")
+
+    manifest = ensure_txt_cache(path)
+    chunks = manifest.get("chunks", [])
+    if index < 0 or index >= len(chunks):
+        bottle.abort(404, "TXT chunk not found")
+    chunk = chunks[index]
+    content_path = get_txt_cache_paths(path)["content_path"]
+    with open(content_path, "rb") as handle:
+      handle.seek(int(chunk["start"]))
+      raw = handle.read(int(chunk["end"]) - int(chunk["start"]))
+    text = raw.decode(manifest.get("charset", "utf-8"), errors="replace")
+    bottle.response.content_type = 'application/json; charset=utf-8'
+    return json.dumps(
+        {
+            "index": int(chunk["index"]),
+            "start": int(chunk["start"]),
+            "end": int(chunk["end"]),
+            "text": text,
+            "hasPrev": index > 0,
+            "hasNext": index < len(chunks) - 1,
+        },
+        ensure_ascii=False,
+    )
 #}}}
 #{{{ reader epub manifest api
 @bottle.route('/api/reader/epub/<token>/manifest')

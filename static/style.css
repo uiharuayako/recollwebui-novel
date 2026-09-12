@@ -286,6 +286,11 @@ hr { border: 1px solid #999 }
 	transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease, box-shadow 0.16s ease;
 }
 
+.reader-button[hidden],
+.reader-txt-rule-hidden[hidden] {
+	display: none;
+}
+
 .reader-button:hover {
 	background: #ece1c7;
 	border-color: #755d3c;
@@ -519,6 +524,25 @@ hr { border: 1px solid #999 }
 	background: transparent;
 }
 
+.reader-txt-slot {
+	width: min(100%, 920px);
+	margin: 0 auto;
+	padding: 0;
+	background: transparent;
+}
+
+.reader-txt-slot + .reader-txt-slot {
+	margin-top: 18px;
+}
+
+.reader-txt-iframe {
+	display: block;
+	width: 100%;
+	min-height: 240px;
+	border: 0;
+	background: transparent;
+}
+
 .reader-epub-slot + .reader-epub-slot {
 	margin-top: 28px;
 }
@@ -717,6 +741,12 @@ hr { border: 1px solid #999 }
 }
 
 @media (max-width: 700px) {
+	.reader-toolbar {
+		max-height: none;
+		overflow: visible;
+		padding-top: max(12px, env(safe-area-inset-top));
+	}
+
 	.reader-body {
 		flex-direction: column;
 	}

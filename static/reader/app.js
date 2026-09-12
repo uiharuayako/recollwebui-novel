@@ -16,6 +16,10 @@ const MIN_FONT_SIZE = 16;
 const MAX_FONT_SIZE = 32;
 const FONT_SIZE_STEP = 2;
 const SCROLL_READER_FORMATS = new Set(['txt', 'md', 'html', 'htm', 'xhtml', 'xml', 'mhtml', 'epub']);
+const TXT_MOUNT_WINDOW_BEFORE = 2;
+const TXT_MOUNT_WINDOW_AFTER = 2;
+const TXT_PRELOAD_WINDOW_BEFORE = 4;
+const TXT_PRELOAD_WINDOW_AFTER = 4;
 const EPUB_MOUNT_WINDOW_BEFORE = 1;
 const EPUB_MOUNT_WINDOW_AFTER = 1;
 const EPUB_PRELOAD_WINDOW_BEFORE = 2;
@@ -72,6 +76,29 @@ const state = {
     progressBadge: null,
     bootstrapHost: null,
   },
+  txtWindow: {
+    syncTimer: 0,
+    syncToken: 0,
+    documentToken: 0,
+    currentIndex: -1,
+    mountedRange: null,
+    preloadRange: null,
+    loaded: new Set(),
+    loading: new Map(),
+    mounted: new Map(),
+    chunkData: new Map(),
+    slots: [],
+    slotHeights: new Map(),
+    averageHeightPerByte: 0.026,
+    restorePosition: null,
+    progressBadge: null,
+    manifest: null,
+    contentUrl: '',
+    charset: 'utf-8',
+    chunkCount: 0,
+    chunkWindowMounted: TXT_MOUNT_WINDOW_BEFORE,
+    chunkWindowPrefetch: TXT_PRELOAD_WINDOW_BEFORE,
+  },
 };
 
 window.Kookit = window.Kookit || {};
@@ -114,6 +141,7 @@ const escapeHtml = (value) => safeText(value)
 const normalizeFormat = (format) => safeText(format).trim().toLowerCase();
 const isChmFormat = (format) => normalizeFormat(format) === 'chm';
 const isEpubFormat = (format) => normalizeFormat(format) === 'epub';
+const isTxtFormat = (format) => normalizeFormat(format) === 'txt';
 const isScrollReaderFormat = (format) => SCROLL_READER_FORMATS.has(normalizeFormat(format));
 const getReaderModeForFormat = (format) => (isScrollReaderFormat(format) || isChmFormat(format) ? 'scroll' : 'single');
 const isPagedReaderMode = (readerMode) => readerMode === 'single' || readerMode === 'double';
@@ -549,7 +577,7 @@ const mountEpubChapterIntoSlot = async (slot, chapterDoc, index, token) => {
   const iframe = document.createElement('iframe');
   iframe.className = 'reader-epub-slot-frame';
   iframe.setAttribute('scrolling', 'no');
-  iframe.setAttribute('sandbox', 'allow-same-origin allow-scripts');
+  iframe.setAttribute('sandbox', 'allow-same-origin');
   iframe.setAttribute('title', safeText(chapterDoc.label || chapterDoc.href || `Chapter ${index + 1}`));
   iframe.src = url;
   slot.appendChild(iframe);
@@ -711,12 +739,13 @@ const syncEpubMountedWindow = async (force = false) => {
   await syncEpubContextWindow(force);
 };
 
-const openEpubScrollDocument = async (item, viewportConfig) => {
+const openEpubScrollDocument = async (item, viewportConfig, openToken) => {
   if (!item || !item.manifestUrl) {
     throw new Error('EPUB 清单地址缺失');
   }
   setLoading(`正在解析 ${item.name || item.title || 'EPUB'} 章节列表…`);
   const manifest = await fetchJson(item.manifestUrl);
+  if (openToken !== state.openToken) return null;
   const chapterDocList = buildEpubChapterDocListFromManifest(manifest);
   if (!chapterDocList.length) {
     throw new Error('EPUB 章节列表为空');
@@ -792,6 +821,7 @@ const openEpubScrollDocument = async (item, viewportConfig) => {
     await rendition.goToPosition({ chapterDocIndex: index, intraChapterOffset: 0 });
   };
   await syncEpubContextWindow(true);
+  if (openToken !== state.openToken) return null;
   if (state.epubWindow.restorePosition) {
     restoreEpubScrollPosition(state.epubWindow.restorePosition);
     state.epubWindow.restorePosition = null;
@@ -983,11 +1013,474 @@ const loadPosition = (item) => {
 
 const isValidTxtPosition = (position) => {
   if (!position || typeof position !== 'object') return false;
-  const chapterDocIndex = position.chapterDocIndex;
-  return typeof chapterDocIndex === 'number' || typeof chapterDocIndex === 'string';
+  const chunkIndex = position.chunkIndex ?? position.chapterDocIndex;
+  return typeof chunkIndex === 'number' || typeof chunkIndex === 'string';
 };
 
 const getActiveContentFrame = () => stage ? stage.querySelector('iframe') : null;
+
+const resetTxtContextWindow = () => {
+  window.clearTimeout(state.txtWindow.syncTimer);
+  state.txtWindow.syncToken += 1;
+  state.txtWindow.documentToken += 1;
+  state.txtWindow.currentIndex = -1;
+  state.txtWindow.mountedRange = null;
+  state.txtWindow.preloadRange = null;
+  state.txtWindow.loaded = new Set();
+  state.txtWindow.loading = new Map();
+  state.txtWindow.mounted = new Map();
+  state.txtWindow.chunkData = new Map();
+  state.txtWindow.slots = [];
+  state.txtWindow.slotHeights = new Map();
+  state.txtWindow.restorePosition = null;
+  state.txtWindow.progressBadge = null;
+  state.txtWindow.manifest = null;
+  state.txtWindow.contentUrl = '';
+  state.txtWindow.charset = 'utf-8';
+  state.txtWindow.chunkCount = 0;
+  if (state.txtWindow.bootstrapHost && state.txtWindow.bootstrapHost.parentNode) {
+    state.txtWindow.bootstrapHost.parentNode.removeChild(state.txtWindow.bootstrapHost);
+  }
+  state.txtWindow.bootstrapHost = null;
+};
+
+const getTxtChunkDocList = () => {
+  if (!state.txtWindow.manifest) return [];
+  return Array.isArray(state.txtWindow.manifest.chunks) ? state.txtWindow.manifest.chunks : [];
+};
+
+const isTxtWindowedMode = () => !!(
+  state.current
+  && isTxtFormat(state.current.format)
+  && state.readerMode === 'scroll'
+  && state.txtWindow.slots.length
+);
+
+const getTxtMountedRange = (index, length) => ({
+  start: Math.max(0, index - TXT_MOUNT_WINDOW_BEFORE),
+  end: Math.min(length - 1, index + TXT_MOUNT_WINDOW_AFTER),
+});
+
+const getTxtPreloadRange = (index, length) => ({
+  start: Math.max(0, index - TXT_PRELOAD_WINDOW_BEFORE),
+  end: Math.min(length - 1, index + TXT_PRELOAD_WINDOW_AFTER),
+});
+
+const getTxtChapterSlot = (index) => state.txtWindow.slots[Number(index) || 0] || null;
+
+const fetchTxtJson = async (url) => {
+  const res = await fetch(url, { credentials: 'same-origin' });
+  if (!res.ok) {
+    throw new Error(await res.text());
+  }
+  return await res.json();
+};
+
+const loadTxtChunk = async (chunkDoc, index) => {
+  if (!chunkDoc || !state.txtWindow.contentUrl) return;
+  if (state.txtWindow.loaded.has(index)) return state.txtWindow.chunkData.get(index);
+  if (state.txtWindow.loading.has(index)) return state.txtWindow.loading.get(index);
+  const documentToken = state.txtWindow.documentToken;
+  const contentUrl = state.txtWindow.contentUrl;
+  const loadPromise = Promise.resolve().then(async () => {
+    const data = await fetchTxtJson(`${contentUrl}/${index}`);
+    if (documentToken !== state.txtWindow.documentToken || contentUrl !== state.txtWindow.contentUrl) {
+      return null;
+    }
+    state.txtWindow.loaded.add(index);
+    state.txtWindow.chunkData.set(index, data);
+    return data;
+  });
+  state.txtWindow.loading.set(index, loadPromise);
+  try {
+    return await loadPromise;
+  } finally {
+    if (state.txtWindow.loading.get(index) === loadPromise) {
+      state.txtWindow.loading.delete(index);
+    }
+  }
+};
+
+const unloadTxtChunk = async (index) => {
+  if (!state.txtWindow.loaded.has(index)) return;
+  state.txtWindow.loaded.delete(index);
+  state.txtWindow.chunkData.delete(index);
+};
+
+const estimateTxtSlotHeight = (chunkDoc, index) => {
+  const cached = state.txtWindow.slotHeights.get(index);
+  if (cached && cached > 0) return cached;
+  const byteLength = Math.max(1, Number(chunkDoc && chunkDoc.byteLength) || 0);
+  const fontScale = Math.max(0.7, Math.min(1.8, state.fontSize / DEFAULT_FONT_SIZE));
+  return Math.max(320, Math.round(byteLength * state.txtWindow.averageHeightPerByte * fontScale));
+};
+
+const setTxtSlotPlaceholderHeight = (slot, chunkDoc, index) => {
+  if (!slot) return;
+  const height = estimateTxtSlotHeight(chunkDoc, index);
+  slot.style.minHeight = `${height}px`;
+};
+
+const updateTxtAverageHeightPerByte = (index, chunkDoc, measuredHeight) => {
+  const byteLength = Math.max(1, Number(chunkDoc && chunkDoc.byteLength) || 0);
+  const ratio = measuredHeight / byteLength;
+  state.txtWindow.averageHeightPerByte = state.txtWindow.averageHeightPerByte * 0.7 + ratio * 0.3;
+  state.txtWindow.slotHeights.set(index, measuredHeight);
+};
+
+const buildTxtWindowStage = (chunkDocList) => {
+  if (!stage) return;
+  stage.innerHTML = '';
+  const slots = [];
+  for (let i = 0; i < chunkDocList.length; i += 1) {
+    const slot = document.createElement('section');
+    slot.className = 'reader-txt-slot';
+    slot.dataset.chunkIndex = String(i);
+    setTxtSlotPlaceholderHeight(slot, chunkDocList[i], i);
+    stage.appendChild(slot);
+    slots.push(slot);
+  }
+  state.txtWindow.slots = slots;
+};
+
+const applyReaderStyleToMountedTxtSlots = () => {
+  const styleText = buildReaderStyle();
+  for (const mounted of state.txtWindow.mounted.values()) {
+    if (!mounted || !mounted.iframe) continue;
+    const doc = mounted.iframe.contentDocument;
+    if (!doc || !doc.head) continue;
+    let style = doc.getElementById('recoll-reader-txt-style');
+    if (!style) {
+      style = doc.createElement('style');
+      style.id = 'recoll-reader-txt-style';
+      doc.head.appendChild(style);
+    }
+    style.textContent = styleText;
+  }
+};
+
+const detachTxtMountedChunk = (index) => {
+  const mounted = state.txtWindow.mounted.get(index);
+  if (!mounted) return;
+  if (mounted.resizeObserver) {
+    mounted.resizeObserver.disconnect();
+  }
+  if (mounted.iframe && mounted.iframe.parentNode) {
+    mounted.iframe.parentNode.removeChild(mounted.iframe);
+  }
+  state.txtWindow.mounted.delete(index);
+};
+
+const normalizeTxtPosition = (position) => {
+  if (!position || typeof position !== 'object') return null;
+  const chunkIndex = Number(position.chunkIndex ?? position.chapterDocIndex ?? 0);
+  if (!Number.isFinite(chunkIndex) || chunkIndex < 0) return null;
+  return {
+    chunkIndex,
+    chunkProgressRatio: Number.isFinite(Number(position.chunkProgressRatio)) ? Number(position.chunkProgressRatio) : 0,
+    scrollTop: Number.isFinite(Number(position.scrollTop)) ? Number(position.scrollTop) : 0,
+  };
+};
+
+const getTxtAnchorFromPosition = (position) => normalizeTxtPosition(position);
+
+const isTxtLegacyPosition = (position) => {
+  if (!position || typeof position !== 'object') return false;
+  return Object.prototype.hasOwnProperty.call(position, 'chapterDocIndex')
+    || Object.prototype.hasOwnProperty.call(position, 'chapterHref')
+    || Object.prototype.hasOwnProperty.call(position, 'chapterTitle')
+    || Object.prototype.hasOwnProperty.call(position, 'text');
+};
+
+const captureTxtRestorePosition = () => {
+  const chunkDocList = getTxtChunkDocList();
+  if (!chunkDocList.length) return null;
+  const currentIndex = Math.max(0, state.txtWindow.currentIndex >= 0 ? state.txtWindow.currentIndex : 0);
+  const slot = getTxtChapterSlot(currentIndex);
+  const ratio = slot && slot.offsetHeight > 0
+    ? Math.max(0, Math.min(1, stage ? (stage.scrollTop - slot.offsetTop) / Math.max(1, slot.offsetHeight) : 0))
+    : 0;
+  return {
+    chunkIndex: currentIndex,
+    chunkProgressRatio: ratio,
+    scrollTop: stage ? Math.max(0, Math.round(stage.scrollTop)) : 0,
+  };
+};
+
+const restoreTxtScrollPosition = (restore) => {
+  if (!restore || !stage || !state.txtWindow.slots.length) return;
+  const slot = state.txtWindow.slots[Math.max(0, Math.min(state.txtWindow.slots.length - 1, Number(restore.chunkIndex) || 0))];
+  if (!slot) return;
+  const ratio = Number.isFinite(Number(restore.chunkProgressRatio))
+    ? Math.max(0, Math.min(1, Number(restore.chunkProgressRatio)))
+    : 0;
+  window.requestAnimationFrame(() => {
+    stage.scrollTop = Math.max(0, Math.round(slot.offsetTop + slot.offsetHeight * ratio));
+  });
+};
+
+const mountTxtChapterIntoSlot = async (slot, chunkDoc, index, token) => {
+  if (!slot || !chunkDoc) return;
+  const existing = state.txtWindow.mounted.get(index);
+  if (existing && existing.slot === slot) return;
+  setTxtSlotPlaceholderHeight(slot, chunkDoc, index);
+  const data = await loadTxtChunk(chunkDoc, index);
+  if (token !== state.txtWindow.syncToken) return;
+  slot.innerHTML = '';
+  const iframe = document.createElement('iframe');
+  iframe.className = 'reader-txt-iframe';
+  iframe.setAttribute('loading', 'eager');
+  iframe.setAttribute('referrerpolicy', 'same-origin');
+  iframe.setAttribute('title', chunkDoc.label || `Chunk ${index + 1}`);
+  slot.appendChild(iframe);
+  const doc = iframe.contentDocument || iframe.contentWindow && iframe.contentWindow.document;
+  if (!doc) return;
+  const text = safeText(data && data.text);
+  doc.open();
+  doc.write(`<!doctype html><html><head><meta charset="utf-8"></head><body>${escapeHtml(text).replace(/\n/g, '<br>')}</body></html>`);
+  doc.close();
+  applyDefaultIframeStyle(doc);
+  applyScrollLayout(doc);
+  if (doc.body) {
+    doc.body.style.whiteSpace = 'pre-wrap';
+    doc.body.style.wordBreak = 'break-word';
+    doc.body.style.overflowWrap = 'break-word';
+    doc.body.style.lineHeight = '1.85';
+    doc.body.style.fontSize = `${state.fontSize}px`;
+  }
+  const updateTxtIframeHeight = () => {
+    const bodyHeight = doc.body ? doc.body.scrollHeight : 0;
+    const htmlHeight = doc.documentElement ? doc.documentElement.scrollHeight : 0;
+    const contentHeight = Math.max(bodyHeight, htmlHeight, 240);
+    const nextHeight = Math.max(320, contentHeight + 16);
+    iframe.style.height = `${nextHeight}px`;
+    iframe.style.minHeight = `${nextHeight}px`;
+    slot.style.minHeight = `${nextHeight}px`;
+    updateTxtAverageHeightPerByte(index, chunkDoc, nextHeight);
+    applyReaderStyleToMountedTxtSlots();
+  };
+  const mounted = { slot, iframe, resizeObserver: null };
+  state.txtWindow.mounted.set(index, mounted);
+  if (typeof ResizeObserver === 'function' && doc.body) {
+    const resizeObserver = new ResizeObserver(() => {
+      if (token !== state.txtWindow.syncToken) return;
+      updateTxtIframeHeight();
+    });
+    resizeObserver.observe(doc.body);
+    if (doc.documentElement) {
+      resizeObserver.observe(doc.documentElement);
+    }
+    mounted.resizeObserver = resizeObserver;
+  }
+  doc.addEventListener('load', (event) => {
+    if (event && event.target && event.target.tagName === 'IMG') {
+      if (token !== state.txtWindow.syncToken) return;
+      updateTxtIframeHeight();
+    }
+  }, true);
+  requestAnimationFrame(() => {
+    if (token !== state.txtWindow.syncToken) return;
+    updateTxtIframeHeight();
+  });
+};
+
+const unmountTxtChapterSlot = async (slot, chunkDoc, index) => {
+  if (!slot || !chunkDoc) return;
+  const mounted = state.txtWindow.mounted.get(index);
+  if (mounted && mounted.resizeObserver) {
+    mounted.resizeObserver.disconnect();
+  }
+  if (mounted && mounted.iframe && mounted.iframe.contentDocument) {
+    try {
+      const measuredHeight = mounted.iframe.getBoundingClientRect().height;
+      if (measuredHeight > 0) {
+        updateTxtAverageHeightPerByte(index, chunkDoc, measuredHeight);
+      }
+    } catch (err) {}
+  }
+  detachTxtMountedChunk(index);
+  slot.innerHTML = '';
+  setTxtSlotPlaceholderHeight(slot, chunkDoc, index);
+  await unloadTxtChunk(index);
+};
+
+const getCurrentTxtChunkIndex = () => {
+  const chunkDocList = getTxtChunkDocList();
+  if (!chunkDocList.length) return -1;
+  const viewportTop = stage ? stage.scrollTop : 0;
+  const viewportLine = viewportTop + Math.max(80, (stage ? stage.clientHeight : 0) * 0.25);
+  let currentIndex = state.txtWindow.currentIndex >= 0 ? state.txtWindow.currentIndex : 0;
+  for (let i = 0; i < state.txtWindow.slots.length; i += 1) {
+    const slot = state.txtWindow.slots[i];
+    if (!slot) continue;
+    if (viewportLine >= slot.offsetTop) {
+      currentIndex = i;
+    } else {
+      break;
+    }
+  }
+  return currentIndex;
+};
+
+const updateTxtProgress = async () => {
+  const chunkDocList = getTxtChunkDocList();
+  if (!chunkDocList.length) return;
+  const currentIndex = Math.max(0, getCurrentTxtChunkIndex());
+  const slot = state.txtWindow.slots[currentIndex];
+  const chunkProgressRatio = slot && slot.offsetHeight > 0
+    ? Math.max(0, Math.min(1, (stage.scrollTop - slot.offsetTop) / slot.offsetHeight))
+    : 0;
+  const badge = state.txtWindow.progressBadge;
+  if (badge) {
+    const percentage = chunkDocList.length > 1 ? Math.round((currentIndex / (chunkDocList.length - 1)) * 100) : 100;
+    badge.textContent = `${percentage}%`;
+  }
+  state.txtWindow.currentIndex = currentIndex;
+  savePosition(state.current, {
+    chunkIndex: currentIndex,
+    chunkProgressRatio,
+    scrollTop: stage ? Math.max(0, Math.round(stage.scrollTop)) : 0,
+  });
+  if (state.folderMeta) {
+    saveFolderCursor(state.folderMeta);
+  }
+};
+
+const syncTxtContextWindow = async (force = false) => {
+  if (!isTxtWindowedMode()) return;
+  const chunkDocList = getTxtChunkDocList();
+  if (!chunkDocList.length) return;
+  const currentIndex = getCurrentTxtChunkIndex();
+  if (currentIndex < 0) return;
+  const token = ++state.txtWindow.syncToken;
+  state.txtWindow.currentIndex = currentIndex;
+  const mountedRange = getTxtMountedRange(currentIndex, chunkDocList.length);
+  const preloadRange = getTxtPreloadRange(currentIndex, chunkDocList.length);
+  state.txtWindow.mountedRange = mountedRange;
+  state.txtWindow.preloadRange = preloadRange;
+  const restore = state.txtWindow.restorePosition || captureTxtRestorePosition();
+  state.txtWindow.restorePosition = null;
+
+  const preloadTasks = [];
+  for (let i = preloadRange.start; i <= preloadRange.end; i += 1) {
+    preloadTasks.push(loadTxtChunk(chunkDocList[i], i));
+  }
+  await Promise.allSettled(preloadTasks);
+  if (token !== state.txtWindow.syncToken) return;
+
+  const mountTasks = [];
+  for (let i = mountedRange.start; i <= mountedRange.end; i += 1) {
+    mountTasks.push(mountTxtChapterIntoSlot(state.txtWindow.slots[i], chunkDocList[i], i, token));
+  }
+  await Promise.allSettled(mountTasks);
+  if (token !== state.txtWindow.syncToken) return;
+
+  const unmountTasks = [];
+  for (let i = 0; i < chunkDocList.length; i += 1) {
+    if (i >= preloadRange.start && i <= preloadRange.end) continue;
+    unmountTasks.push(unmountTxtChapterSlot(state.txtWindow.slots[i], chunkDocList[i], i));
+  }
+  await Promise.allSettled(unmountTasks);
+  if (token !== state.txtWindow.syncToken) return;
+
+  if (restore) {
+    restoreTxtScrollPosition(restore);
+  }
+  void updateTxtProgress();
+};
+
+const scheduleTxtContextWindowSync = (force = false) => {
+  if (!isTxtWindowedMode()) return;
+  window.clearTimeout(state.txtWindow.syncTimer);
+  state.txtWindow.syncTimer = window.setTimeout(() => {
+    void syncTxtContextWindow(force);
+  }, force ? 0 : 120);
+};
+
+const scheduleTxtProgressSync = () => {
+  window.clearTimeout(state.layoutSyncTimer);
+  state.layoutSyncTimer = window.setTimeout(() => {
+    void updateTxtProgress();
+  }, 120);
+};
+
+const bindTxtStageScroll = () => {
+  if (!stage || stage.__recollTxtScrollBound) return;
+  stage.addEventListener('scroll', () => {
+    scheduleTxtContextWindowSync();
+    scheduleTxtProgressSync();
+  }, { passive: true });
+  stage.__recollTxtScrollBound = 'yes';
+};
+
+const openTxtScrollDocument = async (item, openToken) => {
+  if (!item || !item.manifestUrl) {
+    throw new Error('TXT 清单地址缺失');
+  }
+  setLoading(`正在解析 ${item.name || item.title || 'TXT'} 分块索引…`);
+  const manifest = await fetchTxtJson(item.manifestUrl);
+  if (openToken !== state.openToken) return null;
+  const chunkDocList = Array.isArray(manifest && manifest.chunks) ? manifest.chunks : [];
+  if (!chunkDocList.length) {
+    throw new Error('TXT 分块索引为空');
+  }
+  state.txtWindow.manifest = manifest;
+  state.txtWindow.contentUrl = safeText(manifest.contentUrl);
+  state.txtWindow.charset = safeText(manifest.charset || 'utf-8');
+  state.txtWindow.chunkCount = Math.max(0, Number(manifest.chunkCount) || chunkDocList.length);
+  const rendition = {
+    format: 'TXT',
+    readerMode: 'scroll',
+    chunkDocList,
+    tempLocation: {},
+    on() {},
+    setStyle() {},
+    removeContent() {
+      if (stage) stage.innerHTML = '';
+    },
+    getPosition() {
+      return captureTxtRestorePosition() || { chunkIndex: 0, chunkProgressRatio: 0, scrollTop: 0 };
+    },
+    async getProgress() {
+      const length = chunkDocList.length;
+      const currentIndex = Math.max(0, state.txtWindow.currentIndex >= 0 ? state.txtWindow.currentIndex : 0);
+      return { percentage: length > 1 ? currentIndex / (length - 1) : 1 };
+    },
+    async goToPosition(rawPosition) {
+      const position = typeof rawPosition === 'string' ? JSON.parse(rawPosition) : rawPosition;
+      const normalized = normalizeTxtPosition(position) || { chunkIndex: 0, chunkProgressRatio: 0, scrollTop: 0 };
+      state.txtWindow.currentIndex = Math.max(0, Math.min(chunkDocList.length - 1, normalized.chunkIndex));
+      state.txtWindow.restorePosition = normalized;
+      await syncTxtContextWindow(true);
+    },
+  };
+  state.rendition = rendition;
+  window.rendition = rendition;
+  setLoading(`正在准备 ${item.name || item.title || 'TXT'} 阅读窗口…`);
+  buildTxtWindowStage(chunkDocList);
+  bindStageNavigation();
+  bindTxtStageScroll();
+  const savedPosition = loadPosition(item);
+  const pendingRestore = state.pendingRestorePosition && state.pendingRestorePosition.path === item.path
+    ? state.pendingRestorePosition.position
+    : null;
+  const restoreSource = pendingRestore || savedPosition;
+  const restorePosition = isTxtLegacyPosition(restoreSource)
+    ? null
+    : (normalizeTxtPosition(restoreSource) || { chunkIndex: 0, chunkProgressRatio: 0, scrollTop: 0 });
+  state.pendingRestorePosition = null;
+  state.txtWindow.currentIndex = Math.max(0, Math.min(chunkDocList.length - 1, restorePosition.chunkIndex));
+  state.txtWindow.restorePosition = restorePosition;
+  const progressBadge = document.createElement('div');
+  progressBadge.className = 'reader-progress';
+  progressBadge.textContent = '0%';
+  stage.appendChild(progressBadge);
+  state.txtWindow.progressBadge = progressBadge;
+  await syncTxtContextWindow(true);
+  if (openToken !== state.openToken) return null;
+  await updateTxtProgress();
+  return rendition;
+};
 
 const hasMeaningfulChapterDoc = (chapter) => {
   if (!chapter || typeof chapter !== 'object') return false;
@@ -1075,6 +1568,11 @@ const getChmCurrentPosition = () => {
 
 const persistCurrentPosition = () => {
   if (!state.current) return;
+  if (isTxtFormat(state.current.format)) {
+    const position = captureTxtRestorePosition();
+    if (position) savePosition(state.current, position);
+    return;
+  }
   if (isChmFormat(state.current.format)) {
     const position = getChmCurrentPosition();
     if (position) savePosition(state.current, position);
@@ -1161,10 +1659,12 @@ const setError = (text) => {
 const cleanupRendition = () => {
   window.clearTimeout(state.scrollHeightTimer);
   window.clearTimeout(state.epubWindow.syncTimer);
+  window.clearTimeout(state.txtWindow.syncTimer);
   state.currentChmManifest = null;
   state.currentChmHref = '';
   state.currentChmRestore = null;
   resetEpubContextWindow();
+  resetTxtContextWindow();
   if (state.rendition && typeof state.rendition.removeContent === 'function') {
     try { state.rendition.removeContent(); } catch (err) {}
   }
@@ -1179,6 +1679,7 @@ const updatePageButtons = () => {
   const showPageButtons = isPagedReaderMode(state.readerMode);
   syncReaderModeUi();
   const canPage = !isChmFormat(state.current && state.current.format)
+    && !isTxtFormat(state.current && state.current.format)
     && !!(state.rendition && typeof state.rendition.prev === 'function' && typeof state.rendition.next === 'function');
   prevPageButton.hidden = !showPageButtons;
   nextPageButton.hidden = !showPageButtons;
@@ -1505,18 +2006,19 @@ const handleChmFrameLoad = (iframe) => {
   renderSidebar();
 };
 
-const openChmDocument = async (item) => {
+const openChmDocument = async (item, openToken) => {
   const manifestUrl = item.manifestUrl || '';
   if (!manifestUrl) {
     throw new Error('CHM 清单地址缺失');
   }
   const manifest = await fetchJson(manifestUrl);
+  if (openToken !== state.openToken) return null;
   if (!manifest || !manifest.startUrl) {
     throw new Error('CHM 入口页解析失败');
   }
   state.currentChmManifest = manifest;
   state.currentChmHref = normalizeChmHref(manifest.startPath || '');
-  stage.innerHTML = '<iframe id="reader-chm-iframe" class="reader-chm-iframe" title="CHM Reader" loading="eager" referrerpolicy="same-origin"></iframe>';
+  stage.innerHTML = '<iframe id="reader-chm-iframe" class="reader-chm-iframe" title="CHM Reader" loading="eager" referrerpolicy="same-origin" sandbox="allow-same-origin"></iframe>';
   const iframe = getActiveContentFrame();
   if (!iframe) {
     throw new Error('CHM 阅读框初始化失败');
@@ -1691,6 +2193,17 @@ const syncRenditionLayout = async (force = false) => {
     rememberStageSize();
     return;
   }
+  if (state.current && isTxtFormat(state.current.format)) {
+    applyReaderStyleToMountedTxtSlots();
+    state.txtWindow.slots.forEach((slot, index) => {
+      const chunkDoc = getTxtChunkDocList()[index];
+      if (!slot || !chunkDoc) return;
+      setTxtSlotPlaceholderHeight(slot, chunkDoc, index);
+    });
+    rememberStageSize();
+    await syncTxtContextWindow(force);
+    return;
+  }
   if (!state.rendition) return;
 
   state.layoutSyncInFlight = true;
@@ -1763,6 +2276,10 @@ const applyFontSizeChange = async (nextFontSize) => {
     }
     return;
   }
+  if (state.current && isTxtFormat(state.current.format)) {
+    await syncRenditionLayout(true);
+    return;
+  }
   if (!state.rendition) return;
   await syncRenditionLayout(true);
   if (isEpubWindowedMode()) {
@@ -1809,6 +2326,18 @@ const openIndex = async (index) => {
   updatePageButtons();
   setLoading(`正在打开 ${item.name || item.title || ''}`);
   try {
+    if (isTxtFormat(item.format)) {
+      const rendition = await openTxtScrollDocument(item, openToken);
+      if (openToken !== state.openToken) return;
+      state.rendition = rendition;
+      window.rendition = rendition;
+      state.readerMode = 'scroll';
+      updatePageButtons();
+      bindStageNavigation();
+      rememberStageSize();
+      state.isOpening = false;
+      return;
+    }
     if (isChmFormat(item.format)) {
       const pendingRestore = state.pendingRestorePosition && state.pendingRestorePosition.path === item.path
         ? state.pendingRestorePosition.position
@@ -1817,17 +2346,15 @@ const openIndex = async (index) => {
         state.currentChmRestore = pendingRestore;
         state.pendingRestorePosition = null;
       }
-      await openChmDocument(item);
+      await openChmDocument(item, openToken);
       if (openToken !== state.openToken) return;
       bindStageNavigation();
       bindIframeNavigation();
       rememberStageSize();
       return;
     }
-    const response = await fetch(item.url, { credentials: 'same-origin' });
-    if (!response.ok) throw new Error(`读取文件失败: ${response.status}`);
     if (isEpubFormat(item.format)) {
-      const rendition = await openEpubScrollDocument(item, viewportConfig);
+      const rendition = await openEpubScrollDocument(item, viewportConfig, openToken);
       if (openToken !== state.openToken) return;
       state.rendition = rendition;
       window.rendition = rendition;
@@ -1838,16 +2365,19 @@ const openIndex = async (index) => {
       state.isOpening = false;
       return;
     }
+    const response = await fetch(item.url, { credentials: 'same-origin' });
+    if (!response.ok) throw new Error(`读取文件失败: ${response.status}`);
+    const buffer = await response.arrayBuffer();
     const Kookit = window.Kookit;
     const options = {
       format: item.format.toUpperCase(),
       readerMode: viewportConfig.readerMode,
-      charset: item.format === 'txt' ? (item.charset || 'utf-8') : undefined,
+      charset: undefined,
       animation: '',
       convertChinese: 'no',
       fullTranslationMode: 'no',
       textOrientation: 'horizontal',
-      parserRegex: item.format === 'txt' ? (state.parserRegex || '') : '',
+      parserRegex: '',
       isDarkMode: 'no',
       isMobile: viewportConfig.isMobile,
       password: '',
@@ -1856,7 +2386,7 @@ const openIndex = async (index) => {
       isConvertPDF: 'no',
       ocrLang: '',
       ocrEngine: 'paddle',
-      isAllowScript: 'yes',
+      isAllowScript: 'no',
       isBionic: 'no',
       isIndent: 'no',
       isHyphenation: 'no',
@@ -1900,16 +2430,6 @@ const openIndex = async (index) => {
       await rendition.goToPosition(JSON.stringify(resolveInitialPagedPosition(rendition, pendingRestore)));
     } else if (canRestoreSavedPosition(item, savedPosition) && typeof rendition.goToPosition === 'function' && !isEpubFormat(item.format)) {
       await rendition.goToPosition(JSON.stringify(resolveInitialPagedPosition(rendition, savedPosition)));
-    } else if (normalizeFormat(item.format) === 'txt' && typeof rendition.goToPosition === 'function') {
-      await rendition.goToPosition(JSON.stringify({
-        text: '',
-        chapterTitle: '',
-        chapterDocIndex: 0,
-        chapterHref: item.href || 'title0',
-        count: '',
-        page: '',
-        percentage: '0',
-      }));
     } else if (isPagedReaderMode(rendition.readerMode) && typeof rendition.goToPosition === 'function') {
       const defaultPagedPosition = buildDefaultPagedPosition(rendition);
       if (defaultPagedPosition) {
@@ -1967,10 +2487,10 @@ const loadFolderMode = async () => {
   const data = await fetchJson(`${baseApi}/folder?${searchParams.toString()}`);
   state.folderMeta = data;
   state.items = data.items || [];
-  const saved = JSON.parse(localStorage.getItem('recoll-reader:folder') || 'null');
-  state.currentIndex = saved && typeof saved.currentIndex === 'number'
-    ? Math.min(saved.currentIndex, Math.max(0, state.items.length - 1))
-    : (data.currentIndex || 0);
+  state.currentIndex = Math.max(0, Math.min(
+    Number(data.currentIndex) || 0,
+    Math.max(0, state.items.length - 1),
+  ));
   state.current = state.items[state.currentIndex] || state.items[0] || null;
   renderSidebar();
   updateMeta();
@@ -2044,9 +2564,6 @@ nextPageButton.addEventListener('click', () => {
 el('reader-save-regex').addEventListener('click', () => {
   state.parserRegex = parserInput.value.trim();
   localStorage.setItem('recoll-reader:parserRegex', state.parserRegex);
-  if (state.current && state.current.format === 'txt') {
-    void openIndex(state.currentIndex);
-  }
 });
 
 window.addEventListener('beforeunload', () => {
