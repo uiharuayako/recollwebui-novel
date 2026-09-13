@@ -50,5 +50,5 @@ window.RECOLL_READER = {
 };
 </script>
 <script type="module" src="/static/reader/kookit.bundle.js"></script>
-<script type="module" src="/static/reader/app.js"></script>
+<script type="module" src="/static/reader/app.js?v=reader-mobile-2"></script>
 %include("footer")

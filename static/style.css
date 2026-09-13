@@ -744,7 +744,26 @@ hr { border: 1px solid #999 }
 	.reader-toolbar {
 		max-height: none;
 		overflow: visible;
+		flex-shrink: 0;
 		padding-top: max(12px, env(safe-area-inset-top));
+	}
+
+	.reader-toolbar-center {
+		order: 1;
+		flex: 0 0 100%;
+		width: 100%;
+	}
+
+	.reader-toolbar-left {
+		order: 2;
+		flex: 0 0 100%;
+		justify-content: center;
+	}
+
+	.reader-toolbar-right {
+		order: 3;
+		flex: 0 0 100%;
+		justify-content: center;
 	}
 
 	.reader-body {

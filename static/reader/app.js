@@ -2086,7 +2086,7 @@ const buildReaderStyle = () => {
       -webkit-font-smoothing: antialiased;
       hanging-punctuation: first last;
     }
-    a, article, cite, div, li, p, span:not(.kookit-note):not(.kookit-note-icon):not(.kookit-note-tooltip):not(.kookit-word-def):not(.kookit-word-tooltip), pre, dt, dd, table, bold, font, blockquote {
+    body, a, article, cite, div, li, p, span:not(.kookit-note):not(.kookit-note-icon):not(.kookit-note-tooltip):not(.kookit-word-def):not(.kookit-word-tooltip), pre, dt, dd, table, bold, font, blockquote {
       font-size: ${fontSize} !important;
       line-height: ${lineHeight} !important;
       letter-spacing: 0.01em !important;
