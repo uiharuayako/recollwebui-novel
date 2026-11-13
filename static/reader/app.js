@@ -324,6 +324,24 @@ const getEpubPreloadRange = (index, total) => getEpubWindowRange(index, total, {
   after: EPUB_PRELOAD_WINDOW_AFTER,
 });
 
+// Slots that could still hold content from the previous window. Releasing every slot of
+// the book instead costs one forced layout per chapter (clearing a slot re-reads the
+// browser metrics), which freezes the page for tens of seconds on books with thousands
+// of chapters.
+const collectActiveSlotIndexes = (ranges, mountedIndexes) => {
+  const indexes = new Set();
+  for (const range of ranges) {
+    if (!range || !Number.isFinite(range.start) || !Number.isFinite(range.end)) continue;
+    for (let i = Math.max(0, range.start); i <= range.end; i += 1) {
+      indexes.add(i);
+    }
+  }
+  for (const index of mountedIndexes) {
+    indexes.add(Number(index));
+  }
+  return indexes;
+};
+
 const getEpubAnchorFromPosition = (position) => {
   if (!position || !state.rendition || !getEpubChapterDocList().length) return null;
   const chapterIndex = Number(position.chapterDocIndex);
@@ -843,6 +861,8 @@ const syncEpubContextWindow = async (force = false) => {
   if (currentIndex < 0) return;
   const token = ++state.epubWindow.syncToken;
   state.epubWindow.currentIndex = currentIndex;
+  const previousMountedRange = state.epubWindow.mountedRange;
+  const previousPreloadRange = state.epubWindow.preloadRange;
   const mountedRange = getEpubMountedRange(currentIndex, chapterDocList.length);
   const preloadRange = getEpubPreloadRange(currentIndex, chapterDocList.length);
   state.epubWindow.mountedRange = mountedRange;
@@ -866,7 +886,12 @@ const syncEpubContextWindow = async (force = false) => {
   if (token !== state.epubWindow.syncToken) return;
 
   const unmountTasks = [];
-  for (let i = 0; i < chapterDocList.length; i += 1) {
+  const activeIndexes = collectActiveSlotIndexes(
+    [previousMountedRange, previousPreloadRange],
+    state.epubWindow.mounted.keys(),
+  );
+  for (const i of activeIndexes) {
+    if (i < 0 || i >= chapterDocList.length) continue;
     if (i >= preloadRange.start && i <= preloadRange.end) continue;
     unmountTasks.push(unmountEpubChapterSlot(state.epubWindow.slots[i], chapterDocList[i], i));
   }
@@ -1354,6 +1379,8 @@ const syncTxtContextWindow = async (force = false) => {
   if (currentIndex < 0) return;
   const token = ++state.txtWindow.syncToken;
   state.txtWindow.currentIndex = currentIndex;
+  const previousMountedRange = state.txtWindow.mountedRange;
+  const previousPreloadRange = state.txtWindow.preloadRange;
   const mountedRange = getTxtMountedRange(currentIndex, chunkDocList.length);
   const preloadRange = getTxtPreloadRange(currentIndex, chunkDocList.length);
   state.txtWindow.mountedRange = mountedRange;
@@ -1376,7 +1403,12 @@ const syncTxtContextWindow = async (force = false) => {
   if (token !== state.txtWindow.syncToken) return;
 
   const unmountTasks = [];
-  for (let i = 0; i < chunkDocList.length; i += 1) {
+  const activeIndexes = collectActiveSlotIndexes(
+    [previousMountedRange, previousPreloadRange],
+    state.txtWindow.mounted.keys(),
+  );
+  for (const i of activeIndexes) {
+    if (i < 0 || i >= chunkDocList.length) continue;
     if (i >= preloadRange.start && i <= preloadRange.end) continue;
     unmountTasks.push(unmountTxtChapterSlot(state.txtWindow.slots[i], chunkDocList[i], i));
   }

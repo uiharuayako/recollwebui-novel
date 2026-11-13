@@ -9,12 +9,14 @@ import glob
 import hashlib
 import hmac
 import base64
+import collections
 import csv
 import io
 import mimetypes
 import string
 import subprocess
 import tempfile
+import threading
 import shlex
 import posixpath
 import zipfile
@@ -101,6 +103,12 @@ if not READER_TOKEN_SECRET:
 READER_TXT_CACHE_ROOT = os.path.join(g_tmpdir or tempfile.gettempdir(), "recoll-webui-reader", "txt")
 READER_CHM_CACHE_ROOT = os.path.join(g_tmpdir or tempfile.gettempdir(), "recoll-webui-reader", "chm")
 READER_EPUB_CACHE_ROOT = os.path.join(g_tmpdir or tempfile.gettempdir(), "recoll-webui-reader", "epub")
+
+# Number of "keyword in context" snippets kept in the in-process cache. Building a
+# snippet re-reads and re-splits the whole source document, which dominates the cost
+# of a search on large files. The exact same snippets are asked for again on page
+# reloads, history navigation, and for duplicated results.
+SNIPPET_CACHE_SIZE = 2048
 
 # sort fields/labels
 SORTS = [
@@ -1030,7 +1038,7 @@ def read_reader_token(token):
 def resolve_doc_from_result_query(resnum, query=None):
     config = get_config()
     q = query or get_query(config)
-    rclq, db = recoll_initsearch(q)
+    rclq, db, _ = recoll_initsearch(q)
     if "rcludi" in q and q["rcludi"]:
         doc = db.getDoc(q["rcludi"])
     else:
@@ -1383,6 +1391,7 @@ def recoll_initsearch(q):
     db.setAbstractParams(config['maxchars'], config['context'])
     query = db.query()
     query.sortby(q['sort'], q['ascending'])
+    qs = ""
     try:
         qs = query_to_recoll_string(q)
         if "queryfrag" in config and config["queryfrag"]:
@@ -1394,7 +1403,7 @@ def recoll_initsearch(q):
     except Exception as ex:
         msg("Query execute failed: %s" % ex)
         pass
-    return query, db
+    return query, db, qs
 #}}}
 #{{{ HlMeths
 class HlMeths:
@@ -1403,12 +1412,29 @@ class HlMeths:
     def endMatch(self):
         return '</span>'
 #}}}
+#{{{ snippet cache
+_g_snippet_cache = collections.OrderedDict()
+_g_snippet_cache_lock = threading.Lock()
+
+def get_cached_snippet(key):
+    with _g_snippet_cache_lock:
+        snippet = _g_snippet_cache.pop(key, None)
+        if snippet is not None:
+            _g_snippet_cache[key] = snippet
+        return snippet
+
+def put_cached_snippet(key, snippet):
+    with _g_snippet_cache_lock:
+        _g_snippet_cache[key] = snippet
+        while len(_g_snippet_cache) > SNIPPET_CACHE_SIZE:
+            _g_snippet_cache.popitem(last=False)
+#}}}
 #{{{ recoll_search
 def recoll_search(q):
     config = get_config()
     tstart = datetime.datetime.now()
     results = []
-    query,_ = recoll_initsearch(q)
+    query, _, qs = recoll_initsearch(q)
     nres = query.rowcount
     if "rcludi" in q and q["rcludi"]:
         rcludi = q["rcludi"]
@@ -1471,15 +1497,23 @@ def recoll_search(q):
         d['time'] = timestr(d['mtime'], config['timefmt'])
         d['rcludi'] = doc['rcludi']
         if 'snippets' in q and q['snippets']:
-            if highlighter:
-                d['snippet'] = query.makedocabstract(doc, methods=highlighter)
-            else:
-                d['snippet'] = query.makedocabstract(doc)
-            if not d['snippet']:
-                try:
-                    d['snippet'] = doc['abstract']
-                except:
-                    pass
+            snippet_key = (qs, config['stem'], config['stemlang'], config['maxchars'],
+                           config['context'], bool(highlighter), d['url'], d['ipath'],
+                           d['mtime'])
+            snippet = get_cached_snippet(snippet_key)
+            if snippet is None:
+                if highlighter:
+                    snippet = query.makedocabstract(doc, methods=highlighter)
+                else:
+                    snippet = query.makedocabstract(doc)
+                if not snippet:
+                    try:
+                        snippet = doc['abstract']
+                    except:
+                        snippet = ''
+                if snippet:
+                    put_cached_snippet(snippet_key, snippet)
+            d['snippet'] = snippet or ''
         #for n,v in d.items():
         #    print("type(%s) is %s" % (n,type(v)))
         results.append(d)
@@ -1516,6 +1550,12 @@ def main():
 def results():
     config = get_config()
     query = get_query(config)
+    if not bottle.request.query.page:
+        # A missing page parameter means "first page" for the html interface. Left
+        # at 0 it would make recoll_search ignore webui_perpage and render the whole
+        # result set (up to maxresults), which takes seconds of cpu on large
+        # collections. An explicit page=0 keeps its "all results" meaning.
+        query['page'] = 1
     qs = query_to_recoll_string(query)
     res, nres, timer = recoll_search(query)
     if config['maxresults'] == 0:

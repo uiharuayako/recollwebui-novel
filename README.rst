@@ -59,6 +59,11 @@ There's some optional command-line arguments available::
     -h, --help            show this help message and exit
     -a ADDR, --addr ADDR  address to bind to [127.0.0.1]
     -p PORT, --port PORT  port to listen on [8080]
+    -t THREADS, --threads THREADS
+                          number of server worker threads [8]. Building the result
+                          snippets is cpu intensive, so a few extra workers keep
+                          concurrent requests (page assets, second tab) from being
+                          served only when a search has finished
     -c CONFDIR, --config CONFDIR Recoll configuration directory to use
 
 The standalone application can be configured to run automatically using systemd. See the file
