@@ -7,8 +7,6 @@ import sys
 import datetime
 import glob
 import hashlib
-import hmac
-import base64
 import collections
 import csv
 import io
@@ -20,10 +18,20 @@ import threading
 import shlex
 import posixpath
 import zipfile
+import sqlite3
+from types import SimpleNamespace
 import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
+from html import escape as html_escape
 from urllib.parse import parse_qsl, urlencode, quote as urlquote, unquote as urlunquote, urlsplit
 from recoll import recoll, rclextract, rclconfig
+import account_web
+from accounts import Store, NotFound, ValidationError, INTEGER_PREFERENCES
+from webui_data import ApplicationData
+
+APP_ROOT = os.path.dirname(os.path.abspath(__file__))
+bottle.TEMPLATE_PATH.insert(0, os.path.join(APP_ROOT, 'views'))
+account_store = Store()
 
 def msg(s):
     print("%s" % s, file=sys.stderr)
@@ -50,8 +58,8 @@ DEFAULTS = {
     'timefmt': '%c',
     'dirdepth': 2,
     'maxchars': 500,
-    'maxresults': 0,
-    'perpage': 25,
+    'maxresults': 500,
+    'perpage': 500,
     'csvfields': 'filename title author size time mtype url',
     'title_link': 'download',
     'collapsedups': 0,
@@ -95,11 +103,7 @@ READER_SUPPORTED_FORMATS = {
 }
 
 READER_FOLDER_SCAN_LIMIT = 1000
-READER_TOKEN_TTL = 60 * 60 * 12
-READER_TXT_CACHE_VERSION = 2
-READER_TOKEN_SECRET = os.environ.get("RECOLL_READER_TOKEN_SECRET")
-if not READER_TOKEN_SECRET:
-    READER_TOKEN_SECRET = base64.urlsafe_b64encode(os.urandom(32)).decode("ascii")
+READER_TXT_CACHE_VERSION = 3
 READER_TXT_CACHE_ROOT = os.path.join(g_tmpdir or tempfile.gettempdir(), "recoll-webui-reader", "txt")
 READER_CHM_CACHE_ROOT = os.path.join(g_tmpdir or tempfile.gettempdir(), "recoll-webui-reader", "chm")
 READER_EPUB_CACHE_ROOT = os.path.join(g_tmpdir or tempfile.gettempdir(), "recoll-webui-reader", "epub")
@@ -424,6 +428,22 @@ def split_txt_chunks(raw_bytes):
         start = end
     return chunks
 
+def build_txt_outline(raw_bytes, chunks):
+    """Index headings while building the cached text, without a second browser download."""
+    pattern = re.compile(r'^[ \t\u3000]*(第[〇零一二三四五六七八九十百千万两\d]+[章节卷部回篇][^\n]{0,70}|(?:chapter|part|book)\s+[\divxlcdm]+[^\n]{0,70}|序章|序言|前言|楔子|尾声|后记|附录)[ \t]*$', re.IGNORECASE | re.MULTILINE)
+    toc = []
+    for chunk in chunks:
+        text = raw_bytes[chunk['start']:chunk['end']].decode('utf-8', errors='replace')
+        text = text.replace('\r\n', '\n').replace('\r', '\n')
+        for match in pattern.finditer(text):
+            label = match.group(1).strip()
+            # DOM ranges use UTF-16 code units, including for astral characters.
+            offset = len(text[:match.start(1)].encode('utf-16-le')) // 2
+            toc.append({'index': chunk['index'], 'label': label, 'depth': 0,
+                        'textOffset': offset, 'query': label,
+                        'matchLength': len(label.encode('utf-16-le')) // 2})
+    return toc
+
 def ensure_txt_cache(path):
     paths = get_txt_cache_paths(path)
     manifest_path = paths["manifest_path"]
@@ -449,6 +469,7 @@ def ensure_txt_cache(path):
         "chunkCount": len(chunks),
         "estimatedCharsPerChunk": 64 * 1024,
         "chunks": chunks,
+        "toc": build_txt_outline(raw, chunks),
     }
     with open(paths["content_path"], "wb") as handle:
         handle.write(raw)
@@ -950,6 +971,8 @@ def get_reader_format_from_name(name, mtype=""):
         "application/x-chm": "chm",
         "application/vnd.amazon.ebook": "azw3",
         "application/x-mobipocket-ebook": "mobi",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+        "multipart/related": "mhtml",
         "application/x-cbz": "cbz",
         "application/x-cbr": "cbr",
         "application/x-cbt": "cbt",
@@ -995,59 +1018,28 @@ def is_allowed_reader_path(path, config):
     return False
 
 def make_reader_token(path, mimetype="", name=""):
-    payload = {
-        "path": os.path.realpath(path),
-        "mimetype": mimetype or "",
-        "name": name or "",
-        "exp": int(time.time()) + READER_TOKEN_TTL,
-    }
-    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    payload_b64 = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-    signature = hmac.new(
-        READER_TOKEN_SECRET.encode("utf-8"),
-        payload_b64.encode("ascii"),
-        hashlib.sha256,
-    ).digest()
-    sig_b64 = base64.urlsafe_b64encode(signature).decode("ascii").rstrip("=")
-    return f"{payload_b64}.{sig_b64}"
+    return appdata.token_for_path(path, mimetype, name)
 
 def read_reader_token(token):
-    try:
-        payload_b64, sig_b64 = token.split(".", 1)
-        expected = base64.urlsafe_b64encode(
-            hmac.new(
-                READER_TOKEN_SECRET.encode("utf-8"),
-                payload_b64.encode("ascii"),
-                hashlib.sha256,
-            ).digest()
-        ).decode("ascii").rstrip("=")
-        if not hmac.compare_digest(expected, sig_b64):
-            return None
-        raw = base64.urlsafe_b64decode(payload_b64 + "=" * (-len(payload_b64) % 4))
-        payload = json.loads(raw.decode("utf-8"))
-        if int(payload.get("exp", 0)) < int(time.time()):
-            return None
-        path = normalize_file_path(payload.get("path", ""))
-        if not path:
-            return None
-        payload["path"] = path
-        return payload
-    except Exception:
-        return None
+    return appdata.token_payload(token)
 
 def resolve_doc_from_result_query(resnum, query=None):
     config = get_config()
     q = query or get_query(config)
+    appdata.search_event(config, q)
     rclq, db, _ = recoll_initsearch(q)
     if "rcludi" in q and q["rcludi"]:
         doc = db.getDoc(q["rcludi"])
     else:
-        if resnum > rclq.rowcount - 1:
+        if resnum < 0 or resnum > rclq.rowcount - 1:
             bottle.abort(404, "Bad result index %d" % resnum)
         rclq.scroll(resnum)
         doc = rclq.fetchone()
     if not doc:
         bottle.abort(404, "Document not found")
+    source = normalize_file_path(getattr(doc, 'url', '') or '')
+    if not is_allowed_reader_path(source, config):
+        bottle.abort(403, 'Document access denied')
     return config, q, rclq, db, doc
 
 def get_reader_path_for_doc(doc, config):
@@ -1069,16 +1061,16 @@ def build_reader_item(doc, config, path):
         "size": int(getattr(doc, "size", 0) or getattr(doc, "fbytes", 0) or 0),
         "mtime": int(getattr(doc, "mtime", 0) or 0),
         "token": token,
-        "url": f"/api/reader/file/{urlquote(token)}",
+        "url": account_web.app_url(f"/api/reader/file/{urlquote(token)}"),
         "supported": reader_format in READER_SUPPORTED_FORMATS,
     }
     if reader_format == "txt":
-        item["manifestUrl"] = f"/api/reader/txt/{urlquote(token)}/manifest"
+        item["manifestUrl"] = account_web.app_url(f"/api/reader/txt/{urlquote(token)}/manifest")
     elif reader_format == "chm":
-        item["manifestUrl"] = f"/api/reader/chm/{urlquote(token)}/manifest"
+        item["manifestUrl"] = account_web.app_url(f"/api/reader/chm/{urlquote(token)}/manifest")
     elif reader_format == "epub":
-        item["manifestUrl"] = f"/api/reader/epub/{urlquote(token)}/manifest"
-    return item
+        item["manifestUrl"] = account_web.app_url(f"/api/reader/epub/{urlquote(token)}/manifest")
+    return appdata.reader_metadata(item, doc=doc, config=config)
 
 def scan_reader_folder(current_doc, config):
     current_path = get_reader_path_for_doc(current_doc, config)
@@ -1118,13 +1110,13 @@ def scan_reader_folder(current_doc, config):
                 "url": "",
                 "supported": True,
             }
-            item["url"] = f"/api/reader/file/{urlquote(item['token'])}"
+            item["url"] = account_web.app_url(f"/api/reader/file/{urlquote(item['token'])}")
             if reader_format == "txt":
-                item["manifestUrl"] = f"/api/reader/txt/{urlquote(item['token'])}/manifest"
+                item["manifestUrl"] = account_web.app_url(f"/api/reader/txt/{urlquote(item['token'])}/manifest")
             elif reader_format == "chm":
-                item["manifestUrl"] = f"/api/reader/chm/{urlquote(item['token'])}/manifest"
+                item["manifestUrl"] = account_web.app_url(f"/api/reader/chm/{urlquote(item['token'])}/manifest")
             elif reader_format == "epub":
-                item["manifestUrl"] = f"/api/reader/epub/{urlquote(item['token'])}/manifest"
+                item["manifestUrl"] = account_web.app_url(f"/api/reader/epub/{urlquote(item['token'])}/manifest")
             if path == current_path:
                 current_item = item
             items.append(item)
@@ -1154,21 +1146,49 @@ def scan_reader_folder(current_doc, config):
                 "url": "",
                 "supported": True,
             }
-            current_item["url"] = f"/api/reader/file/{urlquote(current_item['token'])}"
+            current_item["url"] = account_web.app_url(f"/api/reader/file/{urlquote(current_item['token'])}")
             if current_format == "txt":
-                current_item["manifestUrl"] = f"/api/reader/txt/{urlquote(current_item['token'])}/manifest"
+                current_item["manifestUrl"] = account_web.app_url(f"/api/reader/txt/{urlquote(current_item['token'])}/manifest")
             elif current_format == "chm":
-                current_item["manifestUrl"] = f"/api/reader/chm/{urlquote(current_item['token'])}/manifest"
+                current_item["manifestUrl"] = account_web.app_url(f"/api/reader/chm/{urlquote(current_item['token'])}/manifest")
             elif current_format == "epub":
-                current_item["manifestUrl"] = f"/api/reader/epub/{urlquote(current_item['token'])}/manifest"
+                current_item["manifestUrl"] = account_web.app_url(f"/api/reader/epub/{urlquote(current_item['token'])}/manifest")
             items.insert(0, current_item)
             current_index = 0
             if len(items) > READER_FOLDER_SCAN_LIMIT:
                 items.pop()
                 truncated = True
 
+    folder_key = appdata.folder_key(root_dir)
+    for item in items:
+        appdata.reader_metadata(item, config=config, folder_key=folder_key)
+    resume = account_store.get_folder_resume(account_web.current_user()['id'], folder_key)
+    resume_warning = ''
+    if resume and bottle.request.query.get('resume') != '0':
+        for index, item in enumerate(items):
+            if item['documentId'] == resume['last_document_id']:
+                current_index = index
+                break
+        else:
+            try:
+                resumed = appdata.document(resume['last_document_id'])
+                if os.path.commonpath([resumed['source_path'], root_dir]) == root_dir:
+                    resumed_doc = appdata.as_recoll_doc(resumed['id'])
+                    resumed_item = build_reader_item(resumed_doc, config, resumed['source_path'])
+                    appdata.reader_metadata(resumed_item, config=config, folder_key=folder_key)
+                    items.insert(0, resumed_item)
+                    current_index = 0
+                    if len(items) > READER_FOLDER_SCAN_LIMIT:
+                        items.pop()
+                        truncated = True
+                else:
+                    resume_warning = '上次阅读的文件已不在该目录中，已打开本次选择的文件。'
+            except (NotFound, ValidationError, OSError):
+                resume_warning = '上次阅读的文件已不可用，已打开本次选择的文件。'
     return {
         "root": root_dir,
+        "folderKey": folder_key,
+        "resumeWarning": resume_warning,
         "currentIndex": current_index,
         "items": items,
         "truncated": truncated,
@@ -1215,13 +1235,10 @@ def commonpathprefix(paths):
 
 #{{{ get_config
 def get_config():
-    # Arrange for apache wsgi SetEnv values to be reflected in the os environment.
-    # This allows people to use either method
-    for k in ("RECOLL_CONFDIR", "RECOLL_EXTRACONFDIRS"):
-        if  k in bottle.request.environ:
-            os.environ[k] = bottle.request.environ[k]
+    if 'recoll.config' in bottle.request.environ:
+        return bottle.request.environ['recoll.config']
     config = {}
-    envdir = safe_envget('RECOLL_CONFDIR')
+    envdir = bottle.request.environ.get('RECOLL_CONFDIR') or safe_envget('RECOLL_CONFDIR')
     # get useful things from recoll.conf
     rclconf = rclconfig.RclConfig(envdir)
     config['confdir'] = rclconf.getConfDir()
@@ -1229,7 +1246,7 @@ def get_config():
     config['dirs'] = dict.fromkeys(topdirs, config['confdir'])
     config['commonprefix'] = commonpathprefix(topdirs)
     # add topdirs from extra config dirs
-    extraconfdirs = safe_envget('RECOLL_EXTRACONFDIRS')
+    extraconfdirs = bottle.request.environ.get('RECOLL_EXTRACONFDIRS') or safe_envget('RECOLL_EXTRACONFDIRS')
     if extraconfdirs:
         config['extraconfdirs'] = shlex.split(extraconfdirs)
         for e in config['extraconfdirs']:
@@ -1249,14 +1266,21 @@ def get_config():
                ("collapsedups", 1), ("synonyms", 0), ("noresultlinks", 1), ("logquery", 1),
                ("shortenpaths", 1), ("permlinks", 1), ("res_permlink", 1), ("queryfrag", 0),
                ]
+    defaults = dict(DEFAULTS)
     for k, isint in fetches:
         value = rclconf.getConfParam("webui_" + k)
         if value is not None:
-            DEFAULTS[k] = int(value) if isint else value
-    # get config from cookies or defaults
-    for k, v in DEFAULTS.items():
-        value = select([bottle.request.get_cookie(k), v], invalid=["None", None])
-        config[k] = type(v)(value)
+            defaults[k] = int(value) if isint else value
+    config.update(defaults)
+    config['locked_search_options'] = (
+        {k: defaults[k] for k in ('stem', 'collapsedups')}
+        if int(rclconf.getConfParam('webui_nosettings') or 0) else {})
+    # Only validated account preferences can override administrator defaults.
+    preferences = account_web.current_settings().get('preferences', {})
+    editable = {'stem', 'collapsedups', 'maxresults', 'perpage', 'context', 'maxchars',
+                'timefmt', 'dirdepth', 'title_link', 'csvfields', 'shortenpaths'}
+    if not int(rclconf.getConfParam('webui_nosettings') or 0):
+        config.update({k: v for k, v in preferences.items() if k in editable})
     # Fix csvfields: get rid of invalid ones to avoid needing tests in the dump function
     cf = config['csvfields'].split()
     ncf = [f for f in cf if f in FIELDS]
@@ -1265,8 +1289,10 @@ def get_config():
     # get mountpoints
     config['mounts'] = {}
     for d in config['dirs']:
-        name = 'mount_%s' % urlquote(d,'')
-        config['mounts'][d] = select([bottle.request.get_cookie(name),
+        name = 'mount_%s_%s' % (account_web.current_user()['id'], urlquote(d,''))
+        cookie_value = bottle.request.get_cookie(name)
+        mount_value = account_web.read_payload(cookie_value, 'device-mount') if cookie_value else None
+        config['mounts'][d] = select([mount_value.get('url') if mount_value else None,
                                       rclconf.getConfParam(f"webui_mount_{d}"),
                                       f"file://{d}"],
                                      [None, ''])
@@ -1279,6 +1305,7 @@ def get_config():
 
     val = rclconf.getConfParam('webui_maxperpage')
     val = 0 if val is None else int(val)
+    config['rclc_maxperpage'] = val
     if val:
         if config['perpage'] == 0 or config['perpage'] > val:
             config['perpage'] = val
@@ -1287,12 +1314,14 @@ def get_config():
     val = 0 if val is None else int(val)
     config['rclc_nosettings'] = val
 
-    val = str(rclconf.getConfParam('webui_defaultsort'))
+    val = preferences.get('defaultsort') if not config['rclc_nosettings'] else None
+    val = val or str(rclconf.getConfParam('webui_defaultsort'))
     config['defsortidx'] = 0
     for i in range(len(SORTS)):
         if SORTS[i][0] == val or SORTS[i][1] == val:
             config['defsortidx'] = i
             break
+    bottle.request.environ['recoll.config'] = config
     return config
 #}}}
 #{{{ get_dirs
@@ -1315,24 +1344,32 @@ def get_dirs(tops, depth):
     return ['<all>'] + v
 #}}}
 #{{{ get_query
-def get_query(config=None):
+def get_query(config=None, params=None):
     defsortidx = config['defsortidx'] if config and 'defsortidx' in config else 0
+    params = bottle.request.query if params is None else params
+    if hasattr(params, 'decode'):
+        try:
+            params = params.decode('utf-8')
+        except UnicodeError:
+            bottle.abort(400, '检索条件必须使用 UTF-8 编码')
     query = {
-        'query': select([bottle.request.query.query, '']),
-        'before': select([bottle.request.query.before, '']),
-        'after': select([bottle.request.query.after, '']),
-        'dir': select([bottle.request.query.dir, '', '<all>'], [None, '']),
-        'sort': select([bottle.request.query.sort, SORTS[defsortidx][0]], [None, '']),
-        'ascending': select_int([bottle.request.query.ascending, 0], default=0),
+        'query': select([params.get('query'), '']),
+        'before': select([params.get('before'), '']),
+        'after': select([params.get('after'), '']),
+        'dir': select([params.get('dir'), '', '<all>'], [None, '']),
+        'sort': select([params.get('sort'), SORTS[defsortidx][0]], [None, '']),
+        'ascending': select_int([params.get('ascending'), 0], default=0),
         # Reader runtimes may write non-numeric positions like "121:06" into the
         # browser URL. Treat invalid search page values as "first page" instead
         # of failing the whole request.
-        'page': select_int([bottle.request.query.page, 0], default=0, minimum=0),
-        'highlight': select_int([bottle.request.query.highlight, 1], default=1),
-        'snippets': select_int([bottle.request.query.snippets, 1], default=1),
+        'page': select_int([params.get('page'), 0], default=0, minimum=0),
+        'highlight': select_int([params.get('highlight'), 1], default=1),
+        'snippets': select_int([params.get('snippets'), 1], default=1),
     }
-    if bottle.request.query.rcludi:
-        query['rcludi'] = bottle.request.query.rcludi
+    if params.get('rcludi'):
+        query['rcludi'] = params.get('rcludi')
+    if params.get('search_id'):
+        query['search_id'] = params.get('search_id')
     #msg("query['query'] : %s" % query['query'])
     return query
 #}}}
@@ -1349,6 +1386,10 @@ def query_to_recoll_string(q):
 #{{{ recoll_initsearch
 def recoll_initsearch(q):
     config = get_config()
+    try:
+        appdata.validate_query(q)
+    except ValidationError as exc:
+        bottle.abort(400, str(exc))
     confdir = config['confdir']
     dbs = []
     """ The reason for this somewhat elaborate scheme is to keep the
@@ -1401,8 +1442,8 @@ def recoll_initsearch(q):
         query.execute(qs, config['stem'], config['stemlang'],
                       collapseduplicates=config['collapsedups'])
     except Exception as ex:
-        msg("Query execute failed: %s" % ex)
-        pass
+        # Do not turn execution errors into successful zero-result history.
+        bottle.abort(400, '查询执行失败，请检查检索表达式')
     return query, db, qs
 #}}}
 #{{{ HlMeths
@@ -1411,6 +1452,62 @@ class HlMeths:
         return '<span class="search-result-highlight">'
     def endMatch(self):
         return '</span>'
+
+
+def reader_match_terms(snippet, expression):
+    """Carry literal matched words into the reader, never a Recoll expression.
+
+    A highlighted excerpt includes stemming-expanded words as they occur in the
+    document. When snippets are disabled, use positive literal query terms and
+    leave metadata-only searches without a misleading content-hit action.
+    """
+    class Matches(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.depth = 0
+            self.parts = []
+            self.terms = []
+
+        def handle_starttag(self, tag, attrs):
+            if self.depth:
+                self.depth += 1
+            elif 'search-result-highlight' in dict(attrs).get('class', '').split():
+                self.depth = 1
+                self.parts = []
+
+        def handle_endtag(self, tag):
+            if self.depth:
+                self.depth -= 1
+                if not self.depth:
+                    self.terms.append(''.join(self.parts))
+
+        def handle_data(self, data):
+            if self.depth:
+                self.parts.append(data)
+
+    parser = Matches()
+    parser.feed(snippet or '')
+    terms = parser.terms
+    if not terms:
+        try:
+            tokens = shlex.split(expression or '')
+        except ValueError:
+            tokens = []
+        negate = False
+        for token in tokens:
+            token = token.strip('()')
+            if token.upper() in ('AND', 'OR'):
+                continue
+            if token.upper() == 'NOT':
+                negate = True
+                continue
+            if negate or token.startswith('-'):
+                negate = False
+                continue
+            if ':' in token or '*' in token or '?' in token:
+                continue
+            terms.append(token)
+    return list(dict.fromkeys(term.strip()[:200] for term in terms if term.strip()))[:16]
 #}}}
 #{{{ snippet cache
 _g_snippet_cache = collections.OrderedDict()
@@ -1449,9 +1546,13 @@ def recoll_search(q):
     if config['perpage'] == 0 or q['page'] == 0:
         config['perpage'] = nres
         q['page'] = 1
+    # "Show all" is still bounded by the administrator's HTML page limit.
+    # Explicit JSON/CSV exports retain their existing full-result semantics.
+    if bottle.request.path not in ('/json', '/csv') and config['rclc_maxperpage']:
+        config['perpage'] = min(config['perpage'], config['rclc_maxperpage'])
     offset = (q['page'] - 1) * config['perpage']
 
-    if query.rowcount > 0:
+    if query.rowcount > 0 and offset < nres:
         if type(query.next) == int:
             query.next = offset
         else:
@@ -1463,7 +1564,7 @@ def recoll_search(q):
         highlighter = None
 
     udibreak = False
-    while len(results) < config['perpage']:
+    while len(results) < min(config['perpage'], max(0, nres - offset)):
         try:
             doc = query.fetchone()
             # Later Recoll versions return None at EOL instead of
@@ -1485,11 +1586,15 @@ def recoll_search(q):
                 d[f] = v
             else:
                 d[f] = ''
+        d['source_url'] = d['url']
         if doc['mtype'] == "application/pdf" and doc['url'].startswith("file://"):
             try:
                 # Note: getfirstmatchpage is only available from recoll 1.44
                 pagenum, term = query.getfirstmatchpage(doc)
                 d['url'] += f"#page={pagenum}&search={urlquote(term)}"
+                if int(pagenum) > 0:
+                    d['reader_match_page'] = int(pagenum)
+                d['reader_match_term'] = str(term or '')[:200]
             except:
                 pass
         d['label'] = select([d['title'], d['filename'], '?'], [None, ''])
@@ -1508,12 +1613,15 @@ def recoll_search(q):
                     snippet = query.makedocabstract(doc)
                 if not snippet:
                     try:
-                        snippet = doc['abstract']
+                        snippet = html_escape(doc['abstract'] or '')
                     except:
                         snippet = ''
                 if snippet:
                     put_cached_snippet(snippet_key, snippet)
             d['snippet'] = snippet or ''
+        d['reader_match_terms'] = reader_match_terms(d.get('snippet', ''), q.get('query', ''))
+        if not d.get('reader_match_term'):
+            d['reader_match_term'] = next(iter(d['reader_match_terms']), '')
         #for n,v in d.items():
         #    print("type(%s) is %s" % (n,type(v)))
         results.append(d)
@@ -1527,13 +1635,17 @@ def recoll_search(q):
 #{{{ static
 @bottle.route('/static/:path#.+#')
 def server_static(path):
-    return bottle.static_file(path, root='./static')
+    return bottle.static_file(path, root=os.path.join(APP_ROOT, 'static'))
 #}}}
 @bottle.route('/staticdoc/:path#.+#')
 def server_staticdoc(path):
-    if not g_tmpdir:
-        return ""
-    return bottle.static_file(path, root=g_tmpdir)
+    # Legacy URLs never expose an entire process-wide temporary directory.
+    payload = read_reader_token(path)
+    if not payload:
+        bottle.abort(404, 'Document resource not found')
+    return bottle.static_file(os.path.basename(payload['path']),
+                              root=os.path.dirname(payload['path']), etag=False,
+                              headers={'Cache-Control': 'private, no-store'})
 #}}}
 #{{{ main
 @bottle.route('/')
@@ -1542,7 +1654,8 @@ def main():
     config = get_config()
     bottle.response.headers['Vary'] = 'Cookie'
     return { 'dirs': get_dirs(config['dirs'], config['dirdepth']),
-            'query': get_query(config), 'sorts': SORTS, 'config': config}
+            'query': get_query(config), 'sorts': SORTS, 'config': config,
+            'recent_readings': account_store.list_readings(account_web.current_user()['id'], limit=5)['items']}
 #}}}
 #{{{ results
 @bottle.route('/results')
@@ -1550,6 +1663,7 @@ def main():
 def results():
     config = get_config()
     query = get_query(config)
+    event = appdata.search_event(config, query)
     if not bottle.request.query.page:
         # A missing page parameter means "first page" for the html interface. Left
         # at 0 it would make recoll_search ignore webui_perpage and render the whole
@@ -1557,7 +1671,25 @@ def results():
         # collections. An explicit page=0 keeps its "all results" meaning.
         query['page'] = 1
     qs = query_to_recoll_string(query)
-    res, nres, timer = recoll_search(query)
+    try:
+        res, nres, timer = recoll_search(query)
+    except (ValidationError, bottle.HTTPError):
+        if event:
+            account_store.fail_search(account_web.current_user()['id'], event['id'])
+        bottle.abort(400, '查询执行失败，请检查检索表达式和筛选条件')
+    appdata.finish_search(event, query, config, nres)
+    for result in res:
+        try:
+            # Use the source URL before PDF search anchors were appended.
+            source = result.get('source_url') or result['url'].split('#', 1)[0]
+            ref = appdata.register_doc(SimpleNamespace(**dict(result, url=source)), config)
+            result['document_id'] = ref['id']
+            result['reader_supported'] = ref['format'] in READER_SUPPORTED_FORMATS
+            result['shelf_handle'] = account_web.sign_payload({'document_id': ref['id']}, 'shelf-add')
+            result['on_shelf'] = account_store.is_on_shelf(account_web.current_user()['id'], ref['id'])
+        except (NotFound, ValidationError, OSError, sqlite3.Error):
+            result['document_id'] = None
+            bottle.request.environ['recoll.notice'] = '搜索已完成，部分书架操作暂不可用，请稍后重试。'
     if config['maxresults'] == 0:
         config['maxresults'] = nres
     if config['perpage'] == 0:
@@ -1568,7 +1700,8 @@ def results():
              get_dirs(config['dirs'], config['dirdepth']),
              'qs': qs, 'sorts': SORTS, 'config': config,
              'query_string': bottle.request.query_string, 'nres': nres,
-             'config': config}
+             'notice': bottle.request.environ.get('recoll.notice', '') or
+                       ('本次搜索历史尚未保存。' if bottle.request.query.get('history_unsaved') else '')}
 #}}}
 #{{{ reader page
 @bottle.route('/reader')
@@ -1585,19 +1718,49 @@ def reader():
             encoding="utf-8",
             errors="strict",
         )
-        if key not in ("mode", "resnum")
+        if key not in ("mode", "resnum", "document_id", "return_to", "reader_search", "reader_term", "reader_page")
     ]
+    results_query_string = urlencode(search_query, doseq=True, encoding='utf-8')
+    results_url = account_web.app_url('/results') + '?' + results_query_string
+    return_to = bottle.request.query.getunicode('return_to', '')
+    if return_to:
+        results_url = account_web.safe_next(return_to)
+    session = account_web.current_session()
+    account = {
+        'userId': account_web.current_user()['id'], 'sessionId': session['id'],
+        'csrf': account_web.csrf_token(), 'settings': account_web.current_settings(),
+        'baseUrl': account_web.app_url('/').rstrip('/'),
+    }
+    reader_config = {
+        'mode': mode, 'queryString': bottle.request.query_string,
+        'resultsQueryString': results_query_string,
+        'apiBase': account_web.app_url('/api/reader'), 'account': account,
+        'initialSearch': {
+            'query': bottle.request.query.getunicode('reader_search', '')[:200],
+            'terms': [str(term)[:200] for term in bottle.request.query.decode('utf-8').getall('reader_term')][:16],
+            'pageNumber': select_int([bottle.request.query.get('reader_page')], default=0, minimum=0),
+        },
+    }
     return {
         "mode": mode,
         "query_string": bottle.request.query_string,
-        "results_query_string": urlencode(search_query, doseq=True, encoding="utf-8", errors="strict"),
+        "results_query_string": results_query_string,
+        "results_url": results_url,
+        'reader_config_json': json.dumps(reader_config, ensure_ascii=True).replace('<', '\\u003c'),
     }
 #}}}
 #{{{ reader book api
 @bottle.route('/api/reader/book')
 def reader_book():
     resnum = select_int([bottle.request.query.resnum, -1], default=-1)
-    config, query, rclq, db, doc = resolve_doc_from_result_query(resnum)
+    if bottle.request.query.get('document_id'):
+        try:
+            config = get_config()
+            doc = appdata.as_recoll_doc(bottle.request.query.document_id)
+        except (NotFound, ValidationError) as exc:
+            bottle.abort(404, str(exc))
+    else:
+        config, query, rclq, db, doc = resolve_doc_from_result_query(resnum)
     if not is_reader_supported_doc(doc):
         bottle.abort(400, "Unsupported format for reader")
     path = get_reader_path_for_doc(doc, config)
@@ -1612,7 +1775,14 @@ def reader_book():
 @bottle.route('/api/reader/folder')
 def reader_folder():
     resnum = select_int([bottle.request.query.resnum, -1], default=-1)
-    config, query, rclq, db, doc = resolve_doc_from_result_query(resnum)
+    if bottle.request.query.get('document_id'):
+        try:
+            config = get_config()
+            doc = appdata.as_recoll_doc(bottle.request.query.document_id)
+        except (NotFound, ValidationError) as exc:
+            bottle.abort(404, str(exc))
+    else:
+        config, query, rclq, db, doc = resolve_doc_from_result_query(resnum)
     if not is_reader_supported_doc(doc):
         bottle.abort(400, "Unsupported format for reader")
     folder_data = scan_reader_folder(doc, config)
@@ -1620,6 +1790,8 @@ def reader_folder():
     return json.dumps({
         "mode": "folder",
         "root": folder_data["root"],
+        "folderKey": folder_data["folderKey"],
+        "resumeWarning": folder_data["resumeWarning"],
         "currentIndex": folder_data["currentIndex"],
         "count": folder_data["count"],
         "truncated": folder_data["truncated"],
@@ -1664,11 +1836,9 @@ def reader_file(token):
             "cb7": "application/x-cb7",
         }
         mimetype = mimetype_map.get(ext, "application/octet-stream")
-    bottle.response.content_type = mimetype
-    bottle.response.headers['Cache-Control'] = 'private, max-age=3600'
-    bottle.response.headers['Content-Length'] = os.stat(path).st_size
-    with open(path, 'rb') as f:
-        return f.read()
+    return bottle.static_file(os.path.basename(path), root=os.path.dirname(path),
+                              mimetype=mimetype, etag=False,
+                              headers={'Cache-Control': 'private, no-store'})
 #}}}
 #{{{ reader txt manifest api
 @bottle.route('/api/reader/txt/<token>/manifest')
@@ -1710,7 +1880,8 @@ def reader_txt_manifest(token):
             "chunkWindowPrefetch": 4,
             "estimatedCharsPerChunk": manifest.get("estimatedCharsPerChunk", 0),
             "chunks": chunks,
-            "contentUrl": f"/api/reader/txt/{urlquote(token)}/chunk",
+            "toc": manifest.get("toc", []),
+            "contentUrl": account_web.app_url(f"/api/reader/txt/{urlquote(token)}/chunk"),
             "cacheKey": paths["key"],
         },
         ensure_ascii=False,
@@ -1770,7 +1941,7 @@ def reader_epub_manifest(token):
         bottle.abort(400, "Not an EPUB document")
 
     manifest = ensure_epub_cache(path)
-    content_prefix = f"/api/reader/epub/{urlquote(token)}/content"
+    content_prefix = account_web.app_url(f"/api/reader/epub/{urlquote(token)}/content")
     chapters = [
         {
             "label": item.get("label", "Untitled"),
@@ -1841,7 +2012,7 @@ def reader_epub_content(token, relpath=""):
     bottle.response.content_type = mimetype or "application/octet-stream"
     if encoding:
         bottle.response.content_type = f"{mimetype}; charset={encoding}"
-    bottle.response.headers['Cache-Control'] = 'private, max-age=3600'
+    bottle.response.headers['Cache-Control'] = 'private, no-store'
     bottle.response.headers['Content-Length'] = len(raw)
     return raw
 #}}}
@@ -1861,7 +2032,7 @@ def reader_chm_manifest(token):
         bottle.abort(400, "Not a CHM document")
 
     files_root, manifest = get_reader_chm_content_root(path)
-    content_prefix = f"/api/reader/chm/{urlquote(token)}/content"
+    content_prefix = account_web.app_url(f"/api/reader/chm/{urlquote(token)}/content")
     toc = [
         {
             "label": item.get("label", "Untitled"),
@@ -1889,7 +2060,7 @@ def reader_chm_manifest(token):
 def rewrite_chm_html_urls(raw_bytes, token):
     """Rewrite absolute paths in CHM HTML content to route through the API.
     Operates at byte level to preserve the original encoding of the file."""
-    prefix_bytes = f'/api/reader/chm/{urlquote(token)}/content'.encode('utf-8')
+    prefix_bytes = account_web.app_url(f'/api/reader/chm/{urlquote(token)}/content').encode('utf-8')
 
     def replace_url(match):
         return match.group(1) + b'=' + match.group(2) + prefix_bytes + match.group(3) + match.group(2)
@@ -1968,7 +2139,7 @@ def reader_chm_content(token, relpath=""):
     elif ext == ".xhtml":
         mimetype = "application/xhtml+xml"
     bottle.response.content_type = mimetype or "application/octet-stream"
-    bottle.response.headers['Cache-Control'] = 'private, max-age=3600'
+    bottle.response.headers['Cache-Control'] = 'private, no-store'
     bottle.response.headers['X-Reader-Path'] = resolved_relpath
     with open(file_path, 'rb') as handle:
         raw = handle.read()
@@ -2012,35 +2183,36 @@ def preview(resnum):
 @bottle.route('/download/<resnum:int>')
 def edit(resnum):
     config, query, rclq, db, doc = resolve_doc_from_result_query(resnum)
-    xt = rclextract.Extractor(doc)
-    path = xt.idoctofile(doc.ipath, doc.mimetype)
-    if "filename" in doc.keys():
-        filename = doc.filename
-    else:
-        filename = os.path.basename(path)
+    source = normalize_file_path(doc.url)
+    filename = doc.filename if "filename" in doc.keys() else os.path.basename(source)
     pagenum = -1
     try:
         # Note: getfirstmatchpage is only available from recoll 1.44
         pagenum, term = rclq.getfirstmatchpage(doc)
     except:
         pass
-    if pagenum != -1 and doc.mimetype == "application/pdf":
-        return \
-            "<html><head></head><body><script>" \
-            f"window.location.replace(\"/staticdoc/{filename}#page={pagenum}&search={term}\");" \
-            "</script></body></html>"
-    else:
-        bottle.response.content_type = doc.mimetype
-        bottle.response.headers['Content-Disposition'] = f'attachment; filename="{filename}"'
-        bottle.response.headers['Content-Length'] = os.stat(path).st_size
-        f = open(path, 'rb')
+    if pagenum != -1 and doc.mimetype == 'application/pdf' and not doc.ipath:
+        token = make_reader_token(source, doc.mimetype, filename)
+        bottle.redirect(account_web.app_url('/staticdoc/' + token) +
+                        '#page=%s&search=%s' % (pagenum, urlquote(term)), 303)
+    xt = rclextract.Extractor(doc)
+    path = os.fsdecode(xt.idoctofile(doc.ipath, doc.mimetype))
+    # The extractor may return a temporary file; it is never exposed as a directory.
+    # Only the document authorized above can reach this response.
+    result = bottle.static_file(os.path.basename(path), root=os.path.dirname(path),
+                                mimetype=doc.mimetype, download=filename, etag=False,
+                                headers={'Cache-Control': 'private, no-store'})
+    # static_file has opened its response body already. On this Unix service an
+    # extracted temporary file can be unlinked while that descriptor streams it.
+    temporary_root = os.path.realpath(g_tmpdir or tempfile.gettempdir())
+    extracted_path = os.path.realpath(path)
+    if (extracted_path != os.path.realpath(source) and
+            os.path.commonpath([extracted_path, temporary_root]) == temporary_root):
         try:
             os.unlink(path)
-        except:
+        except OSError:
             pass
-        bottle.response.headers['Vary'] = 'Cookie'
-        bottle.response.headers['No-Vary-Search'] = 'key-order'
-        return f
+    return result
 
         
 #}}}
@@ -2048,6 +2220,8 @@ def edit(resnum):
 @bottle.route('/json')
 def get_json():
     config = get_config()
+    if config['rclc_nojsoncsv']:
+        bottle.abort(403, '结果导出已被管理员禁用')
     query = get_query(config)
     qs = query_to_recoll_string(query)
     bottle.response.headers['Vary'] = 'Cookie'
@@ -2069,6 +2243,8 @@ def get_json():
 @bottle.route('/csv')
 def get_csv():
     config = get_config()
+    if config['rclc_nojsoncsv']:
+        bottle.abort(403, '结果导出已被管理员禁用')
     query = get_query(config)
     query['page'] = 0
     query['snippets'] = 0
@@ -2097,23 +2273,46 @@ def get_csv():
 @bottle.route('/settings')
 @bottle.view('settings')
 def settings():
-    return get_config()
+    config = get_config()
+    if config['rclc_nosettings']:
+        bottle.abort(403, '搜索设置已被管理员锁定')
+    return config
 
-@bottle.route('/set')
+@bottle.route('/set', method='POST')
 def set_settings():
     config = get_config()
-    for k, v in DEFAULTS.items():
-        bottle.response.set_cookie(k, str(bottle.request.query.get(k)),
-                                   max_age=3153600000, expires=315360000)
+    try:
+        forms = bottle.request.forms.decode('utf-8')
+    except UnicodeError:
+        bottle.abort(400, '设置必须使用 UTF-8 编码')
+    if config['rclc_nosettings']:
+        bottle.abort(403, '搜索设置已被管理员锁定')
+    editable = ('stem', 'collapsedups', 'maxresults', 'perpage', 'context', 'maxchars',
+                'timefmt', 'dirdepth', 'title_link', 'csvfields')
+    preferences = {key: forms.get(key) for key in editable if key in forms}
+    for key in preferences.keys() & INTEGER_PREFERENCES.keys():
+        value = preferences[key]
+        if not re.fullmatch(r'\d+', value):
+            bottle.abort(400, '设置 %s 必须是整数' % key)
+        preferences[key] = int(value)
+    if 'csvfields' in preferences:
+        preferences['csvfields'] = ' '.join(x for x in preferences['csvfields'].split() if x in FIELDS)
+    mounts = {}
     for d in config['dirs']:
-        # We should not set the cookie if the value is the default (identical path). This would
-        # allow the server configuration setting to be used if set. This would also show a wrong
-        # value in the settings screen (default instead of server config value), so not too sure
-        # what the right thing would be here.
-        cookie_name = 'mount_%s' % urlquote(d, '')
-        bottle.response.set_cookie(cookie_name, str(bottle.request.query.get('mount_%s' % d)),
-                                   max_age=3153600000, expires=315360000)
-    bottle.redirect('./')
+        value = forms.get('mount_%s' % d, '')
+        if value and (len(value) > 4096 or urlsplit(value).scheme not in ('file', 'http', 'https', 'ftp', 'local-file')):
+            bottle.abort(400, '不支持的路径映射协议')
+        mounts[d] = value
+    try:
+        account_store.save_settings(account_web.current_user()['id'], preferences=preferences)
+    except ValidationError as exc:
+        bottle.abort(400, str(exc))
+    for d, value in mounts.items():
+        cookie_name = 'mount_%s_%s' % (account_web.current_user()['id'], urlquote(d, ''))
+        bottle.response.set_cookie(cookie_name, account_web.sign_payload({'url': value}, 'device-mount', ttl=86400*30),
+                                   path=account_web.app_url('/'), max_age=86400*30,
+                                   httponly=True, samesite='Lax', secure=bottle.request.urlparts.scheme == 'https')
+    bottle.redirect(account_web.app_url('/'), 303)
 #}}}
 #{{{ osd
 @bottle.route('/osd.xml')
@@ -2121,7 +2320,38 @@ def set_settings():
 def main():
     #config = get_config()
     url = bottle.request.urlparts
-    url = '%s://%s' % (url.scheme, url.netloc)
+    url = '%s://%s%s' % (url.scheme, url.netloc, bottle.request.environ.get('SCRIPT_NAME', '').rstrip('/'))
     return {'url': url}
 #}}}
+
+
+account_web.install(bottle.default_app(), account_store, callbacks={
+    'settings_locked': lambda: bool(get_config()['rclc_nosettings']),
+    'legacy_import': lambda data: appdata.import_legacy(data),
+})
+appdata = ApplicationData(bottle.default_app(), account_store, sys.modules[__name__])
+
+
+@bottle.hook('after_request')
+def protect_document_responses():
+    path = bottle.request.path
+    if path == '/reader':
+        # Generated about:blank/blob reader frames inherit this policy, unlike
+        # the CSP on the source file fetched as an ArrayBuffer by the engine.
+        bottle.response.headers['Content-Security-Policy'] = (
+            "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
+            "font-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' blob:; "
+            "worker-src 'self' blob:; frame-src 'self' blob:; object-src 'none'; "
+            "base-uri 'self'; form-action 'self'")
+    if (path.startswith(('/preview/', '/download/', '/staticdoc/', '/api/reader/file/')) or
+            (path.startswith(('/api/reader/epub/', '/api/reader/chm/')) and '/content' in path)):
+        bottle.response.headers['Content-Security-Policy'] = (
+            "sandbox allow-same-origin; default-src 'none'; script-src 'none'; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
+            "font-src 'self' data:; media-src 'self' blob:; connect-src 'none'; "
+            "object-src 'none'; frame-src 'none'; base-uri 'self'; form-action 'none'")
+        bottle.response.headers['Cache-Control'] = 'private, no-store'
+        bottle.response.headers['X-Content-Type-Options'] = 'nosniff'
+
 # vim: fdm=marker:tw=80:ts=4:sw=4:sts=4:et

@@ -1,7 +1,9 @@
 %import shlex, unicodedata, os, sys
-%from urllib.parse import quote as urlquote
+%from urllib.parse import quote as urlquote, urlencode
 <div class="search-result">
     %number = (query['page'] - 1)*config['perpage'] + i + 1
+    %reader_return_query = urlencode({'return_to': app_url('/results') + '?' + query_string})
+    %reader_hit_query = urlencode({'reader_search': d.get('reader_match_term', ''), 'reader_term': d.get('reader_match_terms', []), 'reader_page': d.get('reader_match_page', 0)}, doseq=True)
     %if config["permlinks"]:
         %if query_string.find("&rcludi=") == -1:
             %query_string += "&rcludi=" + urlquote(d["rcludi"])
@@ -10,7 +12,7 @@
     <div class="search-result-number"><a href="#r{{d['sha']}}">#{{number}}</a></div>
     %url = d['url'].replace('file://', '')
     %reader_ext = os.path.splitext(d['filename'] or d['label'] or '')[1].lower().lstrip('.')
-    %reader_supported = reader_ext in ('txt', 'epub', 'mobi', 'azw', 'azw3', 'fb2', 'chm', 'docx', 'md', 'html', 'htm', 'xhtml', 'xml', 'mhtml', 'pdf', 'cbz', 'cbr', 'cbt', 'cb7') or (d.get('mtype') or '').lower() in ('application/vnd.ms-htmlhelp', 'application/x-chm')
+    %reader_supported = d.get('reader_supported', reader_ext in ('txt', 'epub', 'mobi', 'azw', 'azw3', 'fb2', 'chm', 'docx', 'md', 'html', 'htm', 'xhtml', 'xml', 'mhtml', 'pdf', 'cbz', 'cbr', 'cbt', 'cb7') or (d.get('mtype') or '').lower() in ('application/vnd.ms-htmlhelp', 'application/x-chm'))
     %for dr, prefix in config['mounts'].items():
         %url = url.replace(dr, prefix)
     %end
@@ -19,6 +21,10 @@
         %if config['title_link'] == 'open':
             <a href="{{url}}">{{d['label']}}</a>
         %elif config['title_link'] == 'preview':
+            <a href="preview/{{number-1}}?{{query_string}}">{{d['label']}}</a>
+        %elif config['title_link'] == 'reader' and reader_supported and d.get('document_id') and not d.get('ipath'):
+            <a href="{{app_url('/reader')}}?document_id={{d['document_id']}}&{{reader_return_query}}">{{d['label']}}</a>
+        %else:
             <a href="preview/{{number-1}}?{{query_string}}">{{d['label']}}</a>
         %end
     %else:
@@ -49,12 +55,25 @@
     </div>
     %if not "noresultlinks" in config or not config["noresultlinks"]:
     <div class="search-result-links">
+        %if d.get('document_id'):
+        <button type="button" class="shelf-toggle" data-document-id="{{d['document_id']}}" data-handle="{{d['shelf_handle']}}" data-on-shelf="{{'1' if d['on_shelf'] else '0'}}">{{'移出书架' if d['on_shelf'] else '加入书架'}}</button>
+        %end
         <a href="{{url}}">Open</a>
         <a href="download/{{number-1}}?{{query_string}}">Download</a>
         <a href="preview/{{number-1}}?{{query_string}}" target="_blank">Preview</a>
         %if reader_supported:
-            <a href="reader?mode=book&resnum={{number-1}}&{{query_string}}" target="_blank">阅读本书</a>
-            <a href="reader?mode=folder&resnum={{number-1}}&{{query_string}}" target="_blank">阅读所在文件夹</a>
+            %if d.get('document_id') and not d.get('ipath'):
+            %if d.get('reader_match_term') or d.get('reader_match_page'):
+            <a href="{{app_url('/reader')}}?mode=book&document_id={{d['document_id']}}&{{reader_return_query}}&{{reader_hit_query}}" target="_blank">查看命中</a>
+            %end
+            <a href="{{app_url('/reader')}}?mode=book&document_id={{d['document_id']}}&{{reader_return_query}}" target="_blank">继续阅读</a>
+            <a href="{{app_url('/reader')}}?mode=folder&document_id={{d['document_id']}}&{{reader_return_query}}" target="_blank">阅读所在文件夹</a>
+            %else:
+            %if d.get('reader_match_term') or d.get('reader_match_page'):
+            <a href="reader?mode=book&resnum={{number-1}}&{{query_string}}&{{reader_hit_query}}" target="_blank">查看命中</a>
+            %end
+            <a href="reader?mode=book&resnum={{number-1}}&{{query_string}}" target="_blank">继续阅读</a>
+            %end
         %end
         %if config["permlinks"] and config["res_permlink"]:
             <a href="results?{{query_string}}">Link</a>

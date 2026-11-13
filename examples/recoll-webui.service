@@ -19,6 +19,9 @@ Type=simple
 
 # Run under user recoll
 User=recoll
+StateDirectory=recoll-webui
+StateDirectoryMode=0700
+Environment=RECOLL_WEBUI_DB_PATH=/var/lib/recoll-webui/app.sqlite3
 
 # Set listen port and address as needed.
 # %H is the current host name

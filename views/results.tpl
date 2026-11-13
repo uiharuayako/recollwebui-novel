@@ -1,5 +1,8 @@
 %include('header', title=": " + query['query']+" ("+str(nres)+")")
 %include('search', query=query, dirs=dirs, sorts=sorts, config=config)
+%if notice:
+<p class="account-notice" role="status">{{notice}}</p>
+%end
 <div id="status">
     <div id="found">
         Found <b>{{nres}}</b> matching: <b><i>{{qs}}</i></b>

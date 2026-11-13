@@ -1,0 +1,26 @@
+/* PDFViewer needs one absolutely positioned, native scrolling container. */
+.reader-stage-shell.pdf-reader-shell { position: relative; }
+.reader-stage.pdf-reader-stage {
+  position: absolute !important;
+  inset: 0;
+  width: 100%;
+  height: 100% !important;
+  min-height: 0 !important;
+  overflow: auto !important;
+  padding: 0 !important;
+  touch-action: pan-x pan-y pinch-zoom;
+  overscroll-behavior: contain;
+  overflow-anchor: none;
+  background: #e4e7eb;
+}
+.reader-pdf-pages { min-height: 100%; padding: 12px 0; }
+.reader-pdf-pages .page { margin-bottom: 12px; }
+#reader-app[data-theme='sepia'] .pdf-reader-stage { background: #e3d8c3; }
+#reader-app[data-theme='dark'] .pdf-reader-stage { background: #181c22; }
+@media (prefers-color-scheme: dark) {
+  #reader-app[data-theme='auto'] .pdf-reader-stage { background: #181c22; }
+}
+/* Preserve original document colors; themes affect the surrounding reading area. */
+.reader-pdf-pages .textLayer { user-select: text; }
+.reader-pdf-pages .textLayer .highlight { background: rgba(255, 205, 0, .5); }
+.reader-pdf-pages .textLayer .highlight.selected { background: rgba(255, 130, 0, .65); }

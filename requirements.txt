@@ -1,0 +1,4 @@
+# Password hashing for the multi-account data store.
+argon2-cffi>=23.1,<26
+# Standalone HTTP server; Bottle is included in this repository.
+waitress>=3.0,<4

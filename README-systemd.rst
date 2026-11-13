@@ -21,6 +21,27 @@ assumes the following configuration:
 
 If any of these are different for your installation, change the unit file accordingly.
 
+Account data initialization
+===========================
+
+Install ``requirements.txt`` with the Python interpreter used by the service.
+Before starting it, initialize accounts under its operating-system user::
+
+   $ sudo install -d -o recoll -g recoll -m 700 /var/lib/recoll-webui
+   $ sudo -u recoll env RECOLL_WEBUI_DB_PATH=/var/lib/recoll-webui/app.sqlite3 \
+       /usr/bin/python3 /home/recoll/recoll-webui/manage.py init --username admin
+
+The sample service sets the same database path. If using a virtual environment,
+update both the initialization interpreter and ``ExecStart``. Keep the database,
+signing key and lock files in this persistent private directory, outside the
+source tree and static/document directories.
+
+Optionally install ``examples/recoll-webui-cleanup.service`` and
+``examples/recoll-webui-cleanup.timer`` and enable the timer with
+``systemctl enable --now recoll-webui-cleanup.timer``. Match their user, Python
+interpreter and paths to the application unit. See
+``docs/accounts-and-history.md`` for backups and recovery.
+
 Installing the unit file
 ===================================
 

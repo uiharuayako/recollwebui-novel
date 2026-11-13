@@ -1,34 +1,36 @@
 %include("header", title=" / settings")
 <div id="settings-box">
-<form action="set" method="get">
+<form action="{{app_url('/set')}}" method="post">
+<input type="hidden" name="csrf" value="{{account_csrf()}}">
 	<b>Find similar</b> <small class="gray">(1 or 0, show "squats" and "squatter")</small>
-	<input name="stem" value={{stem}}>
+	<input name="stem" value="{{stem}}">
 	<b>Collapse duplicate results</b> <small class="gray">(1 or 0, only show one of multiple
         results with same content")</small>
-	<input name="collapsedups" value={{collapsedups}}>
-	<b>Max results</b> <small class="gray">(maximum number of results to show)</small>
-	<input name="maxresults" value={{maxresults}}>
+	<input name="collapsedups" value="{{collapsedups}}">
+	<b>Max results</b> <small class="gray">(maximum number of results to show; 0 for no limit)</small>
+	<input name="maxresults" value="{{maxresults}}">
 	<hr>
 	<b>Results per page</b> <small class="gray">(0 for no pagination)</small>
-	<input name="perpage" value={{perpage}}>
+	<input name="perpage" value="{{perpage}}">
 	<b>Context words</b> <small class="gray">(number of words shown in search results)</small>
-	<input name="context" value={{context}}>
+	<input name="context" value="{{context}}">
 	<b>Context characters</b> <small class="gray">(max characters in a snippet)</small>
-	<input name="maxchars" value={{maxchars}}>
+	<input name="maxchars" value="{{maxchars}}">
 	<b>Time</b> <small class="gray">(time format string)</small>
-	<input name="timefmt" value={{timefmt}}>
+	<input name="timefmt" value="{{timefmt}}">
 	<b>Folder depth</b> <small class="gray">(number of levels of the folder dropdown)</small>
-	<input name="dirdepth" value={{dirdepth}}>
+	<input name="dirdepth" value="{{dirdepth}}">
 	<b>Default action</b> <small class="gray">(action to take when clicking result title)</small>
 	<select name="title_link">
 		<option value="download" {{'selected' if title_link == 'download' else ''}}>Download</option>
 		<option value="preview" {{'selected' if title_link == 'preview' else ''}}>Preview</option>
 		<option value="open" {{'selected' if title_link == 'open' else ''}}>Open</option>
+		<option value="reader" {{'selected' if title_link == 'reader' else ''}}>Reader</option>
 	</select>
 	<hr>
 	<b>Locations</b><br>
 	%for d in dirs:
-		<small>{{d}}</small><input name="mount_{{d}}" value={{mounts[d]}}>
+		<small>{{d}}</small><input name="mount_{{d}}" value="{{mounts[d]}}">
 	%end
 	<hr>
         <b>CSV fields</b> <small class="gray">({{fields}})</small><br>

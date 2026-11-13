@@ -1,7 +1,8 @@
 %import re
 <div id="fade"></div>
 <div id="searchbox">
-<form action="results" method="get">
+<form action="{{app_url('/search')}}" method="post">
+<input type="hidden" name="csrf" value="{{account_csrf()}}">
 <table id="form">
 <tr>
     <td id="query-cell">

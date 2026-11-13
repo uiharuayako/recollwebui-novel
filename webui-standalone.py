@@ -21,7 +21,7 @@ if os.path.dirname(__file__) != "":
     os.chdir(os.path.dirname(__file__))
 
 # set up webui and run in own http server
-webui.bottle.debug(True)
+webui.bottle.debug(False)
 webui.bottle.run(server='waitress', host=args.addr, port=args.port,
                  threads=args.threads)
 

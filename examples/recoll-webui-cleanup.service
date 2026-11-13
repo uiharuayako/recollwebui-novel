@@ -1,0 +1,10 @@
+[Unit]
+Description=Remove expired Recoll WebUI account data
+
+[Service]
+Type=oneshot
+User=recoll
+StateDirectory=recoll-webui
+StateDirectoryMode=0700
+Environment=RECOLL_WEBUI_DB_PATH=/var/lib/recoll-webui/app.sqlite3
+ExecStart=/usr/bin/python3 /home/recoll/recoll-webui/manage.py cleanup

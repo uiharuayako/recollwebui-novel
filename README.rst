@@ -10,8 +10,9 @@ on github, you are viewing a mirror of the framagit repo (you're fine :) ).
 As compared to the original, this version has an additional dependency when
 running the webui-standalone.py server (i.e. not with apache): it uses the
 python3-waitress module which must be installed. This makes
-webui-standalone quite suitable for moderate multiaccess loads with no
-authentication needs.
+webui-standalone suitable for moderate multiaccess loads. Local accounts now
+protect searches, documents and exports; every account shares the document
+library and keeps its own bookshelf, history, preferences and reading progress.
 
 An updated version of the original doc follows.
 
@@ -35,6 +36,7 @@ All you need to use the WebUI is:
   the internal bottle server by editing webui-standalone.py
 * Recoll 1.20+ and the Recoll Python3 extension (e.g. the python3-recoll package on Debian-derived
   systems).
+* ``argon2-cffi`` for password hashing (install ``requirements.txt``).
 * A WEB browser
 
 Installation and Usage on MS-Windows
@@ -52,7 +54,25 @@ WebUI only provides a front-end for searching and does not handle index configur
 Run standalone
 --------------
 
-Run ``webui-standalone.py`` and connect to ``http://localhost:8080``.
+Install dependencies and initialize the account database as the operating-system
+user that will run the application::
+
+    python3 -m pip install -r requirements.txt
+    export RECOLL_WEBUI_DB_PATH=/absolute/private/directory/app.sqlite3
+    python3 manage.py init --username admin
+
+The management command prompts for a 15–128 character password. The first login
+requires changing that initial password. The database and its ``.secret`` signing
+key must persist between restarts and be shared by all local workers. An
+uninitialized application returns a setup error instead of enabling anonymous
+access. Recoll remains a system dependency; a virtual environment must be able to
+import its Python extension.
+
+Run ``webui-standalone.py`` and connect to ``http://localhost:8080``. Use the same
+``RECOLL_WEBUI_DB_PATH`` for the management commands and the server.
+
+See `account, bookshelf and history operations <docs/accounts-and-history.md>`_
+for setup, backup, recovery, retention and verification details.
 
 There's some optional command-line arguments available::
 
@@ -74,6 +94,13 @@ Environment variables:
 - `RECOLL_CONFDIR` the recoll configuration directory. This is overriden by a -c option.
 - `RECOLL_EXTRACONFDIRS` a space-separated list of external indexes to query in addition to the main
   one.
+- ``RECOLL_WEBUI_DB_PATH`` the local persistent SQLite database; defaults to
+  ``~/.local/share/recoll-webui/app.sqlite3`` for the service user.
+- ``RECOLL_WEBUI_TRUSTED_PROXIES`` explicitly trusted proxy IP addresses/CIDRs
+  (space or comma separated). Only these proxies may supply forwarded address and
+  HTTPS information.
+- ``RECOLL_WEBUI_COOKIE_SECURE`` defaults to ``auto``; set ``true`` for an
+  HTTPS-only deployment.
 
 
 Run as WSGI/CGI
@@ -121,8 +148,9 @@ The initial defaults can be changed by setting values in the main recoll configu
 - webui_timefmt ("%c") format of the time display.
 - webui_dirdepth (2) depth of the directory selection tree. Beware if your data set has many
   directories.
-- webui_maxresults (0) limit the number of results (0 means no limit).
-- webui_perpage (25) number of results per page.
+- webui_maxresults (500) default limit on the total number of results. Users can change this in
+  Settings (0 means no limit).
+- webui_perpage (500) number of results per page.
 - webui_csvfields ("filename title author size time mtype url") fields extracted in CSV or JSON dumps.
 - webui_title_link ("download") action performed if you click the result title (or 'open',
   'preview').
@@ -149,6 +177,38 @@ The following are not changeable from the user interface:
 - webui_res_permlink (0) add a stable link to the result itself (right of `Preview` and `Download`).
 - webui_queryfrag query fragment to append to all user queries (e.g.: -mime:inode/directory to not
   show results which are actually folders).
+
+Reading documents in the browser
+--------------------------------
+
+The reader keeps TXT, EPUB, HTML and PDF documents in a continuous vertical
+scrolling view, including on phones. The compact toolbar provides a collapsible
+navigation panel with separate contents, book list and full-book search tabs.
+PDF pages retain selectable text, links, outline navigation, highlighted search,
+zoom and rotation through the locally bundled Mozilla PDF.js viewer components.
+
+Reading settings include light, warm-paper, dark and system themes, font family
+and size, line height, paragraph spacing, content width, alignment and indentation.
+Publisher typography can be retained. Settings belong to the signed-in account.
+Text anchors preserve the visible passage when the layout changes; older saved
+positions remain supported. Images open in an enlarged view and footnotes open
+in a small dialog without leaving the current passage.
+
+Search results offer separate actions to inspect a match or resume reading.
+Inspecting a match temporarily preserves the original reading position; use
+the return action or explicitly continue from the inspected position. Ctrl/Cmd+F
+opens full-book search, Page Up/Down or Space scrolls, and H toggles the toolbar.
+TXT headings are indexed when the text cache is built, so opening the contents
+does not download the entire book to the browser. EPUB and TXT continue to mount
+only the surrounding chapters or chunks.
+
+The interface takes inspiration from `Readest <https://github.com/readest/readest>`_
+(quiet reading surface, separate navigation and typography controls) and
+`Koodo Reader <https://github.com/koodo-reader/koodo-reader>`_ (reading controls
+and document navigation). The layout and reader integration
+are implemented for this application. PDF rendering uses the pinned upstream
+`PDF.js <https://github.com/mozilla/pdf.js>`_ components with their bundled license;
+see ``vendor-build/pdfjs/README.md`` for reproducible asset builds.
 
 Running the indexer
 -------------------

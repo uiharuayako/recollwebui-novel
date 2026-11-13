@@ -38,3 +38,9 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+
+*.sqlite3
+*.sqlite3-*
+*.sqlite3.secret
+*.sqlite3.lock
+test-results/

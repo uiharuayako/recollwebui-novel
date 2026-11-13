@@ -1,8 +1,18 @@
 body {	margin: 0; font-family: sans-serif; overflow-x: hidden }
 * { font-family: inherit; box-sizing: border-box }
+.reader-page-root {
+	--reader-viewport-height: 100vh;
+}
+
+@supports (height: 100dvh) {
+	.reader-page-root {
+		--reader-viewport-height: 100dvh;
+	}
+}
+
 .reader-page-root,
 .reader-page {
-	height: 100%;
+	height: var(--reader-viewport-height);
 	overflow: hidden;
 }
 
@@ -184,7 +194,7 @@ hr { border: 1px solid #999 }
 	--reader-panel-bg: linear-gradient(180deg, rgba(255, 250, 241, 0.96), rgba(247, 239, 223, 0.98));
 	--reader-panel-border: rgba(151, 128, 96, 0.22);
 	--reader-shadow: 0 24px 60px rgba(64, 46, 24, 0.12);
-	height: 100vh;
+	height: 100%;
 	display: flex;
 	flex-direction: column;
 	background:
@@ -775,7 +785,7 @@ hr { border: 1px solid #999 }
 		position: fixed;
 		top: 0;
 		left: 0;
-		bottom: 0;
+		height: var(--reader-viewport-height);
 		width: min(84vw, 320px);
 		max-height: none;
 		border-right: 1px solid #d4c9af;
@@ -802,6 +812,7 @@ hr { border: 1px solid #999 }
 	.reader-sidebar-backdrop {
 		position: fixed;
 		inset: 0;
+		height: var(--reader-viewport-height);
 		border: 0;
 		padding: 0;
 		background: rgba(31, 25, 19, 0.38);
@@ -869,10 +880,6 @@ hr { border: 1px solid #999 }
 		padding-top: 0;
 		border-radius: 0;
 	}
-
-	.reader-shell.reader-scroll-mode .reader-stage {
-		min-height: calc(100vh - 210px);
-	}
 }
 
 @media (max-width: 420px) {
@@ -926,10 +933,6 @@ hr { border: 1px solid #999 }
 
 	.reader-shell.reader-scroll-mode .reader-stage-shell {
 		border-radius: 0;
-	}
-
-	.reader-shell.reader-scroll-mode .reader-stage {
-		min-height: calc(100vh - 230px);
 	}
 
 	.reader-progress {

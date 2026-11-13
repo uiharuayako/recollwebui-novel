@@ -1,0 +1,5 @@
+-r requirements.txt
+pytest>=8,<10
+WebTest>=3,<4
+# Optional browser checks use an installed Chromium or RECOLL_TEST_CHROMIUM.
+playwright>=1.50,<2
