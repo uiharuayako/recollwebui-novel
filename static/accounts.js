@@ -134,6 +134,17 @@
     document.querySelectorAll('button.shelf-toggle').forEach(button => button.addEventListener('click', async () => {
       if (button.disabled) return;
       button.disabled = true;
+      const container = button.closest('.search-result-links') || button.parentElement;
+      let feedback = container.querySelector('.app-shelf-status');
+      if (!feedback) {
+        feedback = document.createElement('span');
+        feedback.className = 'app-shelf-status';
+        feedback.setAttribute('role', 'status');
+        feedback.setAttribute('aria-live', 'polite');
+        container.append(feedback);
+      }
+      feedback.dataset.error = 'false';
+      feedback.textContent = '正在更新书架…';
       try {
         const removing = button.dataset.onShelf === '1';
         const body = removing ? {document_id: button.dataset.documentId} : {handle: button.dataset.handle};
@@ -145,8 +156,12 @@
         button.dataset.onShelf = removing ? '0' : '1';
         button.textContent = removing ? '加入书架' : '移出书架';
         button.setAttribute('aria-pressed', removing ? 'false' : 'true');
+        feedback.textContent = removing ? '已移出书架，阅读进度仍会保留。' : '已加入我的书架。';
         broadcast('bookshelf-changed', {documentId: button.dataset.documentId});
-      } catch (error) { window.alert(error.message || '书架保存失败，请重试。'); }
+      } catch (error) {
+        feedback.dataset.error = 'true';
+        feedback.textContent = error.message || '书架保存失败，请重试。';
+      }
       finally { if (!expired) button.disabled = false; }
     }));
     prepareLegacyImport();

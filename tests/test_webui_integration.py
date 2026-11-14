@@ -158,6 +158,7 @@ def test_search_event_completes_once_and_reads_never_add_events(site):
     first = client.get(target)
     assert found(first) == 3
     assert len(first.html.select('.search-result')) == 1
+    assert first.html.select_one('.app-result-heading .app-folder-name').get_text() == site.books.name
     assert history_rows(site)[0]['result_count'] == 3
     completed_at = history_rows(site)[0]['completed_at']
     client.get(target)
@@ -306,8 +307,11 @@ def test_plaintext_abstract_fallback_never_executes_document_markup(site, query,
 def test_bookshelf_is_account_scoped_and_is_independent_of_history(site):
     alice, bob = client_for(site), client_for(site, 'bob')
     book = book_for(alice)
+    assert book['folder_name'] == site.books.name
     post_json(alice, '/api/bookshelf/add', {'handle': book['openHandle']})
-    assert book['title'] in alice.get('/bookshelf').text
+    shelf = alice.get('/bookshelf')
+    assert book['title'] in shelf.text
+    assert shelf.html.select_one('.account-book-body .app-folder-name').get_text() == site.books.name
     assert book['title'] not in bob.get('/bookshelf').text
     post_json(bob, '/api/bookshelf/remove', {'document_id': book['documentId']}, status=404)
     post_json(bob, '/api/bookshelf/add', {'handle': book['openHandle']}, status=403)
@@ -675,7 +679,7 @@ def test_result_reader_entries_return_to_the_original_search_page(site, prefix, 
     if entry == 'title':
         link = results.html.select_one('.search-result-title a')
     else:
-        label = '继续阅读' if entry == 'book' else '阅读所在文件夹'
+        label = '单独阅读此文件' if entry == 'book' else '阅读当前文件夹'
         link = next(link for link in results.html.select('.search-result-links a')
                     if link.text.strip() == label)
     destination = local_url(link['href'])
@@ -700,7 +704,7 @@ def test_reader_search_hits_are_separate_from_continue_reading(site, prefix):
     results = client.get('/results', params={'query': 'sharedgalaxy'})
     links = results.html.select('.search-result-links a')
     hit = next(link for link in links if link.text.strip() == '查看命中')
-    resume = next(link for link in links if link.text.strip() == '继续阅读')
+    resume = next(link for link in links if link.text.strip() == '单独阅读此文件')
     hit_query = parse_qs(urlsplit(hit['href']).query)
     assert hit_query['reader_search'] == ['sharedgalaxy']
     assert 'reader_search' not in parse_qs(urlsplit(resume['href']).query)

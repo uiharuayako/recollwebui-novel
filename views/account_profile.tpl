@@ -1,5 +1,6 @@
 %include('header', title=' / 个人账号')
-<main class="account-page">
+<main id="main-content" tabindex="-1" class="account-page">
+  <p class="account-eyebrow">MAKE IT YOURS</p>
   <h1>个人账号</h1>
   <p>{{user.get('display_name') or user['username']}} <span class="account-muted">@{{user['username']}} · {{'管理员' if user['role'] == 'admin' else '普通用户'}}</span></p>
   %if saved:

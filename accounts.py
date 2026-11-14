@@ -57,8 +57,65 @@ class AuthenticationError(RuntimeError):
     pass
 
 
+class RegistrationError(RuntimeError):
+    pass
+
+
+class RegistrationClosed(RegistrationError):
+    pass
+
+
+class RegistrationThrottled(RegistrationError):
+    pass
+
+
 def _id():
     return uuid.uuid4().hex
+
+
+def folder_name(path):
+    parent = os.path.dirname(path)
+    return os.path.basename(parent) or parent
+
+
+def _document_summary(row):
+    result = dict(row)
+    result["folder_name"] = folder_name(result.pop("source_path"))
+    return result
+
+
+def folder_identity(library_key, path):
+    return hashlib.sha256((library_key + "\0" + os.path.realpath(path)).encode()).hexdigest()
+
+
+def _shelf_protects_progress(row):
+    # Paths are canonical; compare the separator as well so /books-old is not
+    # treated as a descendant of /books. A directory protects only its library.
+    return ("EXISTS(SELECT 1 FROM bookshelf shelf "
+            "JOIN document_refs saved ON saved.id=shelf.document_id "
+            "JOIN document_refs document ON document.id=" + row + ".document_id "
+            "WHERE shelf.user_id=" + row + ".user_id AND (saved.id=document.id OR "
+            "(saved.format='folder' AND saved.library_key=document.library_key AND "
+            "substr(document.source_path,1,length(rtrim(saved.source_path,'/'))+1)="
+            "rtrim(saved.source_path,'/')||'/')))")
+
+
+def _shelf_protects_folder(row):
+    return ("EXISTS(SELECT 1 FROM bookshelf shelf "
+            "JOIN document_refs saved ON saved.id=shelf.document_id "
+            "WHERE shelf.user_id=" + row + ".user_id AND saved.format='folder' "
+            "AND folder_identity(saved.library_key,saved.source_path)=" + row + ".folder_key)")
+
+
+def _share_protects_document(row):
+    # Keep chapter identities stable while a folder link exists, so cleanup
+    # cannot invalidate resource URLs already loaded by an anonymous reader.
+    return ("EXISTS(SELECT 1 FROM share_links share "
+            "JOIN document_refs shared ON shared.id=share.document_id "
+            "WHERE shared.id=" + row + ".id OR "
+            "(shared.format='folder' AND shared.library_key=" + row + ".library_key AND "
+            "substr(" + row + ".source_path,1,length(rtrim(shared.source_path,'/'))+1)="
+            "rtrim(shared.source_path,'/')||'/'))")
 
 
 def _json(value, maximum=16384):
@@ -113,11 +170,28 @@ CREATE TABLE login_throttle(bucket_key TEXT PRIMARY KEY, window_start REAL NOT N
 """
 
 
+# This additive extension keeps existing version-1 databases usable. Creation is
+# serialized by SQLite before the first share operation; it never rebuilds or
+# modifies the existing account tables.
+SHARE_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS share_links(id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, document_id TEXT NOT NULL REFERENCES document_refs(id), token TEXT UNIQUE NOT NULL, created_at REAL NOT NULL, expires_at REAL NOT NULL, updated_at REAL NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS shares_user ON share_links(user_id,created_at DESC,id DESC)",
+)
+
+RECOMMENDATION_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS search_recommendations(user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, document_id TEXT NOT NULL REFERENCES document_refs(id), source_query TEXT NOT NULL, updated_at REAL NOT NULL, PRIMARY KEY(user_id,document_id))",
+    "CREATE INDEX IF NOT EXISTS recommendations_user ON search_recommendations(user_id,updated_at DESC)",
+)
+
+
 class Store:
     def __init__(self, path=None):
         raw = path or os.environ.get("RECOLL_WEBUI_DB_PATH") or "~/.local/share/recoll-webui/app.sqlite3"
         self.path = os.path.abspath(os.path.expanduser(os.fspath(raw)))
         self.secret_path = self.path + ".secret"
+        self.registration_path = self.path + ".registration.json"
+        self._shares_initialized = False
+        self._recommendations_initialized = False
 
     @contextlib.contextmanager
     def _connection(self, write=False):
@@ -125,6 +199,7 @@ class Store:
             raise SetupRequired("Initialize the application database before starting workers")
         connection = sqlite3.connect(Path(self.path).as_uri() + "?mode=rw", uri=True, timeout=3, isolation_level=None)
         connection.row_factory = sqlite3.Row
+        connection.create_function("folder_identity", 2, folder_identity, deterministic=True)
         try:
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("PRAGMA busy_timeout=3000")
@@ -177,6 +252,9 @@ class Store:
                 try:
                     connection.execute("PRAGMA journal_mode=" + ("WAL" if _safe_wal_version() else "DELETE"))
                     connection.executescript("BEGIN IMMEDIATE;" + SCHEMA + "INSERT INTO schema_migrations VALUES (1, strftime('%s','now'));COMMIT;")
+                    with connection:
+                        for statement in SHARE_SCHEMA + RECOMMENDATION_SCHEMA:
+                            connection.execute(statement)
                 finally:
                     connection.close()
             if not os.path.exists(self.secret_path):
@@ -227,6 +305,150 @@ class Store:
         except sqlite3.IntegrityError as exc:
             raise ConflictError("Username is already in use") from exc
         return self._user(row)
+
+    def _registration_config(self):
+        try:
+            with open(self.registration_path, encoding="utf-8") as stream:
+                raw = stream.read(8193)
+        except FileNotFoundError:
+            return {"enabled": False, "activation_required": True, "activation_code_hash": ""}
+        except UnicodeError as exc:
+            raise SetupRequired("Registration configuration is invalid") from exc
+        try:
+            config = json.loads(raw)
+            if (len(raw) > 8192 or not isinstance(config, dict)
+                    or type(config.get("enabled")) is not bool
+                    or type(config.get("activation_required")) is not bool
+                    or not isinstance(config.get("activation_code_hash"), str)
+                    or len(config["activation_code_hash"]) > 1024):
+                raise ValueError()
+        except (ValueError, TypeError, RecursionError) as exc:
+            raise SetupRequired("Registration configuration is invalid") from exc
+        return {key: config[key] for key in ("enabled", "activation_required", "activation_code_hash")}
+
+    @staticmethod
+    def _registration_public(config):
+        return {"enabled": config["enabled"], "activation_required": config["activation_required"],
+                "activation_code_set": bool(config["activation_code_hash"])}
+
+    def registration_settings(self):
+        # Atomic replacement lets readers observe a whole old or new configuration.
+        # A missing private sidecar always closes public registration.
+        return self._registration_public(self._registration_config())
+
+    @contextlib.contextmanager
+    def _registration_lock(self):
+        descriptor = os.open(self.path + ".registration.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(descriptor)
+
+    def _save_registration_config(self, config):
+        temporary = self.registration_path + "." + secrets.token_hex(12) + ".tmp"
+        try:
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                stream.write(_json(config))
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.registration_path)
+            descriptor = os.open(os.path.dirname(self.registration_path), os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temporary)
+
+    @staticmethod
+    def _require_registration_admin(connection, actor_id):
+        actor = connection.execute("SELECT role FROM users WHERE id=? AND status='active'", (actor_id,)).fetchone()
+        if not actor or actor["role"] != "admin":
+            raise AuthenticationError("Administrator access required")
+
+    def configure_registration(self, actor_id, enabled, activation_required, activation_code=""):
+        if type(enabled) is not bool or type(activation_required) is not bool:
+            raise ValidationError("Registration switches must be booleans")
+        if not isinstance(activation_code, str) or len(activation_code) > 128:
+            raise ValidationError("Activation code must contain at most 128 characters")
+        with self._connection() as connection:
+            self._require_registration_admin(connection, actor_id)
+        # Hashing does not keep a database transaction or the configuration lock open.
+        encoded = PASSWORDS.hash(activation_code) if activation_code else None
+        with self._registration_lock():
+            with self._connection(write=True) as connection:
+                self._require_registration_admin(connection, actor_id)
+                config = self._registration_config()
+                if encoded is not None:
+                    config["activation_code_hash"] = encoded
+                config.update(enabled=enabled, activation_required=activation_required)
+                if enabled and activation_required and not config["activation_code_hash"]:
+                    raise ValidationError("Set an activation code before requiring it for registration")
+                self._save_registration_config(config)
+        return self._registration_public(config)
+
+    def _registration_attempt(self, address):
+        # Separate namespace: successful registrations also consume the address budget.
+        key = "register:" + hashlib.sha256(str(address or "unknown").encode()).hexdigest()
+        now = time.time()
+        with self._connection(write=True) as connection:
+            current = connection.execute("SELECT * FROM login_throttle WHERE bucket_key=?", (key,)).fetchone()
+            if current and current["expires_at"] > now and current["blocked_until"] > now:
+                raise RegistrationThrottled("Too many registration attempts; try again later")
+            in_window = current and current["window_start"] > now - 900 and current["expires_at"] > now
+            count = current["failure_count"] + 1 if in_window else 1
+            start = current["window_start"] if in_window else now
+            delay = min(300, 2 ** min(count - 5, 9)) if count >= 5 else 0
+            connection.execute("INSERT OR REPLACE INTO login_throttle VALUES(?,?,?,?,?)",
+                               (key, start, count, now + delay, now + 900))
+
+    @staticmethod
+    def _verify_registration_code(config, activation_code):
+        if not config["enabled"]:
+            raise RegistrationClosed("Registration is closed")
+        encoded = config["activation_code_hash"]
+        if config["activation_required"]:
+            try:
+                valid = bool(encoded) and PASSWORDS.verify(encoded, activation_code)
+            except (VerifyMismatchError, VerificationError, InvalidHashError):
+                valid = False
+            if not valid:
+                raise RegistrationError("Activation code is invalid")
+        return encoded if config["activation_required"] else None
+
+    def register_user(self, username, password, activation_code="", address=""):
+        self._registration_attempt(address)
+        username = _username(username)
+        password = _password(password)
+        if not isinstance(activation_code, str) or len(activation_code) > 128:
+            raise ValidationError("Activation code must contain at most 128 characters")
+        verified_hash = self._verify_registration_code(self._registration_config(), activation_code)
+        password_hash = PASSWORDS.hash(password)
+        identifier, now = _id(), time.time()
+        while True:
+            with self._registration_lock():
+                config = self._registration_config()
+                if not config["enabled"]:
+                    raise RegistrationClosed("Registration is closed")
+                # An administrator may have rotated the code while hashing. Release
+                # the lock to verify the current code, then check it again before insert.
+                if not config["activation_required"] or (config["activation_code_hash"] and config["activation_code_hash"] == verified_hash):
+                    try:
+                        with self._connection(write=True) as connection:
+                            connection.execute("INSERT INTO users VALUES (?,?,?,?,'member','active',0,1,?,?)",
+                                               (identifier, username, "", password_hash, now, now))
+                            connection.execute("INSERT INTO user_settings(user_id,updated_at) VALUES (?,?)", (identifier, now))
+                            row = connection.execute("SELECT * FROM users WHERE id=?", (identifier,)).fetchone()
+                    except sqlite3.IntegrityError as exc:
+                        raise ConflictError("Username is already in use") from exc
+                    return self._user(row)
+            verified_hash = self._verify_registration_code(config, activation_code)
 
     def list_users(self):
         with self._connection() as connection:
@@ -384,6 +606,25 @@ class Store:
                 connection.execute("UPDATE sessions SET last_seen_at=?,idle_expires_at=MIN(?,absolute_expires_at) WHERE id=? AND revoked_at IS NULL AND last_seen_at<?", (now, now + 7 * DAY, row["id"], now - 300))
         return result
 
+    def get_resource_session(self, session_id):
+        """Read a live session for a verified resource ticket without extending it."""
+        if not isinstance(session_id, str) or not 1 <= len(session_id) <= 128:
+            return None
+        now = time.time()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT s.* FROM sessions s JOIN users u ON u.id=s.user_id "
+                "AND u.auth_version=s.auth_version WHERE s.id=? AND s.revoked_at IS NULL "
+                "AND s.idle_expires_at>? AND s.absolute_expires_at>? AND u.status='active'",
+                (session_id, now, now)).fetchone()
+            if not row:
+                return None
+            user = connection.execute("SELECT * FROM users WHERE id=?", (row["user_id"],)).fetchone()
+            result = {key: row[key] for key in ("id", "user_id", "created_at", "last_seen_at",
+                      "idle_expires_at", "absolute_expires_at", "device_label", "auth_version")}
+            result.update(user=self._user(user), settings=self._settings(connection, row["user_id"]))
+            return result
+
     def list_sessions(self, user_id):
         now = time.time()
         with self._connection() as connection:
@@ -443,9 +684,11 @@ class Store:
                 raise NotFound("Search not found")
             return self._search(row)
 
-    def complete_search(self, user_id, search_id, query, settings_snapshot, result_count):
+    def complete_search(self, user_id, search_id, query, settings_snapshot, result_count, recommendation_ids=None):
         encoded, snapshot = _json(query), _json(settings_snapshot)
         _integer(result_count)
+        if recommendation_ids:
+            self._ensure_recommendations()
         with self._connection(write=True) as connection:
             settings = self._settings(connection, user_id)
             if not settings["search_history_enabled"]:
@@ -454,6 +697,8 @@ class Store:
             changed = connection.execute("UPDATE search_history SET status='success',completed_at=?,result_count=?,settings_snapshot=? WHERE id=? AND user_id=? AND status='pending' AND history_epoch=? AND query_json=? AND created_at>?", (time.time(), result_count, snapshot, search_id, user_id, settings["search_epoch"], encoded, time.time() - DAY))
             if changed.rowcount:
                 self._cap(connection, "search_history", user_id, "completed_at", 500, "status='success'")
+                if recommendation_ids:
+                    self._save_recommendations(connection, user_id, recommendation_ids, query.get("query", ""))
             return bool(changed.rowcount)
 
     def fail_search(self, user_id, search_id):
@@ -527,6 +772,129 @@ class Store:
                 raise NotFound("Document not found")
             return dict(row)
 
+    def _ensure_recommendations(self):
+        if self._recommendations_initialized:
+            return
+        with self._connection() as connection:
+            exists = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='search_recommendations'").fetchone()
+        if not exists:
+            with self._connection(write=True) as connection:
+                for statement in RECOMMENDATION_SCHEMA:
+                    connection.execute(statement)
+        self._recommendations_initialized = True
+
+    def _save_recommendations(self, connection, user_id, document_ids, source_query):
+        if not isinstance(source_query, str) or not isinstance(document_ids, (list, tuple)):
+            raise ValidationError("Invalid search recommendations")
+        if not all(isinstance(identifier, str) and identifier for identifier in document_ids):
+            raise ValidationError("Invalid document identity")
+        now = time.time()
+        for document_id in dict.fromkeys(document_ids):
+            changed = connection.execute(
+                "INSERT INTO search_recommendations(user_id,document_id,source_query,updated_at) "
+                "SELECT ?,id,?,? FROM document_refs WHERE id=? "
+                "ON CONFLICT(user_id,document_id) DO UPDATE SET source_query=excluded.source_query,updated_at=excluded.updated_at",
+                (user_id, source_query[:200], now, document_id))
+            if not changed.rowcount:
+                raise NotFound("Document not found")
+        self._cap(connection, "search_recommendations", user_id, "updated_at", 60)
+
+    def add_recommendations(self, user_id, document_ids, source_query=''):
+        self._ensure_recommendations()
+        with self._connection(write=True) as connection:
+            self._require_user(connection, user_id)
+            self._save_recommendations(connection, user_id, document_ids, source_query)
+
+    def remove_recommendation(self, user_id, document_id):
+        self._ensure_recommendations()
+        with self._connection(write=True) as connection:
+            self._require_user(connection, user_id)
+            if not connection.execute("DELETE FROM search_recommendations WHERE user_id=? AND document_id=?", (user_id, document_id)).rowcount:
+                raise NotFound("Recommendation not found")
+
+    def list_recommendations(self, user_id, limit=60, library_key=None):
+        limit = _integer(limit, 1, 60)
+        self._ensure_recommendations()
+        where = " AND d.library_key=?" if library_key is not None else ""
+        arguments = (user_id,) + ((library_key,) if library_key is not None else ()) + (limit,)
+        with self._connection() as connection:
+            self._require_user(connection, user_id)
+            rows = connection.execute(
+                "SELECT r.document_id,r.source_query,r.updated_at,d.title,d.format,d.source_path,d.ipath,d.library_key "
+                "FROM search_recommendations r JOIN document_refs d ON d.id=r.document_id WHERE r.user_id=?" + where +
+                " ORDER BY r.updated_at DESC,r.rowid DESC LIMIT ?", arguments).fetchall()
+            return [dict(row) for row in rows]
+
+    def _ensure_shares(self):
+        if self._shares_initialized:
+            return
+        with self._connection() as connection:
+            exists = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='share_links'").fetchone()
+        if not exists:
+            with self._connection(write=True) as connection:
+                for statement in SHARE_SCHEMA:
+                    connection.execute(statement)
+        self._shares_initialized = True
+
+    @staticmethod
+    def _share(row):
+        result = _document_summary(row)
+        result["expired"] = result["expires_at"] <= time.time()
+        return result
+
+    def create_share(self, user_id, document_id, expires_days=7):
+        days = _integer(expires_days, 1, 3650)
+        self._ensure_shares()
+        identifier, token, now = _id(), secrets.token_urlsafe(48), time.time()
+        with self._connection(write=True) as connection:
+            self._require_user(connection, user_id)
+            document = connection.execute("SELECT * FROM document_refs WHERE id=?", (document_id,)).fetchone()
+            if not document:
+                raise NotFound("Document not found")
+            if document["format"] not in FORMATS | {"folder"}:
+                raise ValidationError("This document format cannot be shared")
+            connection.execute("INSERT INTO share_links VALUES(?,?,?,?,?,?,?)", (identifier, user_id, document_id, token, now, now + days * DAY, now))
+            row = connection.execute("SELECT s.*,d.title,d.format,d.source_path FROM share_links s JOIN document_refs d ON d.id=s.document_id WHERE s.id=?", (identifier,)).fetchone()
+            return self._share(row)
+
+    def list_shares(self, user_id, limit=20, cursor=None):
+        limit, after = self._page(limit, cursor)
+        self._ensure_shares()
+        where = " AND (s.created_at<? OR (s.created_at=? AND s.id<?))" if after else ""
+        arguments = (user_id,) + ((after[0], after[0], after[1]) if after else ()) + (limit + 1,)
+        with self._connection() as connection:
+            self._require_user(connection, user_id)
+            rows = connection.execute("SELECT s.*,d.title,d.format,d.source_path FROM share_links s JOIN document_refs d ON d.id=s.document_id WHERE s.user_id=?" + where + " ORDER BY s.created_at DESC,s.id DESC LIMIT ?", arguments).fetchall()
+        return self._paged(rows, limit, "created_at", self._share)
+
+    def get_public_share(self, token):
+        if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{64}", token):
+            return None
+        self._ensure_shares()
+        with self._connection() as connection:
+            row = connection.execute("SELECT s.*,d.title,d.format,d.source_path FROM share_links s JOIN users u ON u.id=s.user_id AND u.status='active' JOIN document_refs d ON d.id=s.document_id WHERE s.token=? AND s.expires_at>?", (token, time.time())).fetchone()
+            return self._share(row) if row else None
+
+    def update_share(self, user_id, share_id, expires_days=7):
+        days = _integer(expires_days, 1, 3650)
+        self._ensure_shares()
+        now = time.time()
+        with self._connection(write=True) as connection:
+            self._require_user(connection, user_id)
+            changed = connection.execute("UPDATE share_links SET expires_at=?,updated_at=? WHERE id=? AND user_id=?", (now + days * DAY, now, share_id, user_id))
+            if not changed.rowcount:
+                raise NotFound("Share link not found")
+            row = connection.execute("SELECT s.*,d.title,d.format,d.source_path FROM share_links s JOIN document_refs d ON d.id=s.document_id WHERE s.id=? AND s.user_id=?", (share_id, user_id)).fetchone()
+            return self._share(row)
+
+    def delete_share(self, user_id, share_id):
+        self._ensure_shares()
+        with self._connection(write=True) as connection:
+            self._require_user(connection, user_id)
+            if not connection.execute("DELETE FROM share_links WHERE id=? AND user_id=?", (share_id, user_id)).rowcount:
+                raise NotFound("Share link not found")
+        return {"id": share_id, "deleted": True}
+
     @staticmethod
     def _progress(row):
         if not row:
@@ -536,7 +904,7 @@ class Store:
         return result
 
     def _get_progress(self, connection, user_id, document_id):
-        return self._progress(connection.execute("SELECT p.* FROM reading_progress p WHERE p.user_id=? AND p.document_id=? AND (p.updated_at>? OR EXISTS(SELECT 1 FROM bookshelf b WHERE b.user_id=p.user_id AND b.document_id=p.document_id))", (user_id, document_id, time.time() - 365 * DAY)).fetchone())
+        return self._progress(connection.execute("SELECT p.* FROM reading_progress p WHERE p.user_id=? AND p.document_id=? AND (p.updated_at>? OR " + _shelf_protects_progress("p") + ")", (user_id, document_id, time.time() - 365 * DAY)).fetchone())
 
     def get_progress(self, user_id, document_id):
         with self._connection() as connection:
@@ -547,7 +915,9 @@ class Store:
     def _cap(connection, table, user_id, time_key, count, condition="1=1"):
         # Identifiers and conditions originate exclusively from this module.
         if table == "reading_progress":
-            condition = "(" + condition + ") AND NOT EXISTS(SELECT 1 FROM bookshelf b WHERE b.user_id=reading_progress.user_id AND b.document_id=reading_progress.document_id)"
+            condition = "(" + condition + ") AND NOT " + _shelf_protects_progress(table)
+        elif table == "folder_resume":
+            condition = "(" + condition + ") AND NOT " + _shelf_protects_folder(table)
         connection.execute("DELETE FROM " + table + " WHERE user_id=? AND " + condition + " AND rowid NOT IN (SELECT rowid FROM " + table + " WHERE user_id=? AND " + condition + " ORDER BY " + time_key + " DESC,rowid DESC LIMIT ?)", (user_id, user_id, count))
 
     def open_reading(self, user_id, document_id, reading_epoch, progress_epoch, folder_key=None):
@@ -569,7 +939,7 @@ class Store:
                 self._cap(connection, "reading_history", user_id, "last_opened_at", 1000)
             if progress_valid:
                 # Expired rows must not restore old progress or block a fresh explicit open.
-                connection.execute("DELETE FROM reading_progress WHERE user_id=? AND document_id=? AND updated_at<=? AND NOT EXISTS(SELECT 1 FROM bookshelf b WHERE b.user_id=reading_progress.user_id AND b.document_id=reading_progress.document_id)", (user_id, document_id, now - 365 * DAY))
+                connection.execute("DELETE FROM reading_progress WHERE user_id=? AND document_id=? AND updated_at<=? AND NOT " + _shelf_protects_progress("reading_progress"), (user_id, document_id, now - 365 * DAY))
                 connection.execute("INSERT OR IGNORE INTO reading_progress(user_id,document_id,position_json,content_version,updated_at) VALUES(?,?,'{}',?,?)", (user_id, document_id, document["content_version"], now))
                 self._cap(connection, "reading_progress", user_id, "updated_at", 1000)
                 if folder_key:
@@ -645,8 +1015,8 @@ class Store:
         now = time.time()
         arguments = (now - 365 * DAY, user_id, now - 180 * DAY) + ((after[0], after[0], after[1]) if after else ()) + (limit + 1,)
         with self._connection() as connection:
-            rows = connection.execute("SELECT r.*,d.title,d.format,d.content_version,p.progress,p.revision FROM reading_history r JOIN document_refs d ON d.id=r.document_id LEFT JOIN reading_progress p ON p.user_id=r.user_id AND p.document_id=r.document_id AND (p.updated_at>? OR EXISTS(SELECT 1 FROM bookshelf b WHERE b.user_id=p.user_id AND b.document_id=p.document_id)) WHERE r.user_id=? AND r.last_opened_at>?" + where + " ORDER BY r.last_opened_at DESC,r.id DESC LIMIT ?", arguments).fetchall()
-        return self._paged(rows, limit, "last_opened_at", dict)
+            rows = connection.execute("SELECT r.*,d.title,d.format,d.source_path,d.content_version,p.progress,p.revision FROM reading_history r JOIN document_refs d ON d.id=r.document_id LEFT JOIN reading_progress p ON p.user_id=r.user_id AND p.document_id=r.document_id AND (p.updated_at>? OR " + _shelf_protects_progress("p") + ") WHERE r.user_id=? AND r.last_opened_at>?" + where + " ORDER BY r.last_opened_at DESC,r.id DESC LIMIT ?", arguments).fetchall()
+        return self._paged(rows, limit, "last_opened_at", _document_summary)
 
     def delete_reading(self, user_id, document_id=None, clear_progress=False):
         with self._connection(write=True) as connection:
@@ -676,7 +1046,7 @@ class Store:
 
     def get_folder_resume(self, user_id, folder_key):
         with self._connection() as connection:
-            row = connection.execute("SELECT * FROM folder_resume WHERE user_id=? AND folder_key=? AND updated_at>?", (user_id, folder_key, time.time() - 365 * DAY)).fetchone()
+            row = connection.execute("SELECT * FROM folder_resume WHERE user_id=? AND folder_key=? AND (updated_at>? OR " + _shelf_protects_folder("folder_resume") + ")", (user_id, folder_key, time.time() - 365 * DAY)).fetchone()
             return dict(row) if row else None
 
     def add_to_shelf(self, user_id, document_id):
@@ -705,9 +1075,25 @@ class Store:
         arguments = (user_id,) + ((after[0], after[0], after[1]) if after else ()) + (limit + 1,)
         with self._connection() as connection:
             self._require_user(connection, user_id)
-            rows = connection.execute("SELECT b.document_id AS id,b.*,d.title,d.format,d.content_version,p.progress,p.revision,p.position_json,r.last_opened_at FROM bookshelf b JOIN document_refs d ON d.id=b.document_id LEFT JOIN reading_progress p ON p.user_id=b.user_id AND p.document_id=b.document_id LEFT JOIN reading_history r ON r.user_id=b.user_id AND r.document_id=b.document_id WHERE b.user_id=?" + where + " ORDER BY b.added_at DESC,b.document_id DESC LIMIT ?", arguments).fetchall()
+            rows = connection.execute("""
+                SELECT b.document_id AS id,b.*,d.title,d.format,d.source_path,d.content_version,
+                       resumed.id AS resume_document_id,resumed.title AS resume_title,
+                       p.progress,p.revision,p.position_json,
+                       CASE WHEN d.format='folder' THEN COALESCE(r.last_opened_at,f.updated_at)
+                            ELSE r.last_opened_at END AS last_opened_at
+                FROM bookshelf b JOIN document_refs d ON d.id=b.document_id
+                LEFT JOIN folder_resume f ON d.format='folder' AND f.user_id=b.user_id
+                    AND f.folder_key=folder_identity(d.library_key,d.source_path)
+                LEFT JOIN document_refs resumed ON resumed.id=f.last_document_id
+                    AND resumed.library_key=d.library_key
+                    AND substr(resumed.source_path,1,length(rtrim(d.source_path,'/'))+1)=rtrim(d.source_path,'/')||'/'
+                LEFT JOIN reading_progress p ON p.user_id=b.user_id
+                    AND p.document_id=CASE WHEN d.format='folder' THEN resumed.id ELSE b.document_id END
+                LEFT JOIN reading_history r ON r.user_id=b.user_id
+                    AND r.document_id=CASE WHEN d.format='folder' THEN resumed.id ELSE b.document_id END
+                WHERE b.user_id=?""" + where + " ORDER BY b.added_at DESC,b.document_id DESC LIMIT ?", arguments).fetchall()
         def convert(row):
-            result = dict(row)
+            result = _document_summary(row)
             result["position"] = json.loads(result.pop("position_json")) if result.get("position_json") else None
             return result
         return self._paged(rows, limit, "added_at", convert)
@@ -731,9 +1117,11 @@ class Store:
             return self._get_progress(connection, user_id, document_id)
 
     def cleanup(self):
+        self._ensure_shares()
+        self._ensure_recommendations()
         now, removed = time.time(), {}
         # Bounded batches keep each transaction short; the scheduler is the single caller.
-        tasks = [("sessions", "revoked_at IS NOT NULL OR idle_expires_at<=? OR absolute_expires_at<=?", (now, now)), ("search_history", "(status='success' AND completed_at<=?) OR (status!='success' AND created_at<=?)", (now - 90 * DAY, now - DAY)), ("reading_history", "last_opened_at<=?", (now - 180 * DAY,)), ("reading_progress", "updated_at<=? AND NOT EXISTS(SELECT 1 FROM bookshelf b WHERE b.user_id=reading_progress.user_id AND b.document_id=reading_progress.document_id)", (now - 365 * DAY,)), ("folder_resume", "updated_at<=?", (now - 365 * DAY,)), ("login_throttle", "expires_at<=?", (now,))]
+        tasks = [("sessions", "revoked_at IS NOT NULL OR idle_expires_at<=? OR absolute_expires_at<=?", (now, now)), ("search_history", "(status='success' AND completed_at<=?) OR (status!='success' AND created_at<=?)", (now - 90 * DAY, now - DAY)), ("reading_history", "last_opened_at<=?", (now - 180 * DAY,)), ("reading_progress", "updated_at<=? AND NOT " + _shelf_protects_progress("reading_progress"), (now - 365 * DAY,)), ("folder_resume", "updated_at<=? AND NOT " + _shelf_protects_folder("folder_resume"), (now - 365 * DAY,)), ("login_throttle", "expires_at<=?", (now,))]
         with self._maintenance_lock():
             for table, where, arguments in tasks:
                 removed[table] = 0
@@ -744,7 +1132,7 @@ class Store:
                     if count < 250:
                         break
             with self._connection(write=True) as connection:
-                removed["document_refs"] = connection.execute("DELETE FROM document_refs WHERE id IN (SELECT d.id FROM document_refs d WHERE last_verified_at<? AND NOT EXISTS(SELECT 1 FROM reading_history r WHERE r.document_id=d.id) AND NOT EXISTS(SELECT 1 FROM reading_progress p WHERE p.document_id=d.id) AND NOT EXISTS(SELECT 1 FROM folder_resume f WHERE f.last_document_id=d.id) AND NOT EXISTS(SELECT 1 FROM bookshelf b WHERE b.document_id=d.id) LIMIT 250)", (now - DAY,)).rowcount
+                removed["document_refs"] = connection.execute("DELETE FROM document_refs WHERE id IN (SELECT d.id FROM document_refs d WHERE last_verified_at<? AND NOT EXISTS(SELECT 1 FROM reading_history r WHERE r.document_id=d.id) AND NOT EXISTS(SELECT 1 FROM reading_progress p WHERE p.document_id=d.id) AND NOT EXISTS(SELECT 1 FROM folder_resume f WHERE f.last_document_id=d.id) AND NOT EXISTS(SELECT 1 FROM bookshelf b WHERE b.document_id=d.id) AND NOT EXISTS(SELECT 1 FROM search_recommendations r WHERE r.document_id=d.id) AND NOT " + _share_protects_document("d") + " LIMIT 250)", (now - DAY,)).rowcount
         return removed
 
     def backup(self, path):
@@ -800,6 +1188,8 @@ class Store:
                     with contextlib.suppress(FileNotFoundError):
                         os.unlink(self.path + suffix)
                 os.replace(staging, self.path)
+                self._shares_initialized = False
+                self._recommendations_initialized = False
             except sqlite3.DatabaseError as exc:
                 raise ValidationError("Backup is not a valid application database") from exc
             finally:

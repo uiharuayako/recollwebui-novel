@@ -10,7 +10,7 @@ import time
 import pytest
 
 from accounts import (AuthenticationError, ConflictError, NotFound, SetupRequired,
-                      Store, ValidationError, DAY)
+                      Store, ValidationError, DAY, folder_identity)
 
 PASSWORD = "test password longer than fifteen"
 NEW_PASSWORD = "new password longer than fifteen"
@@ -306,6 +306,95 @@ def test_shelf_does_not_create_reading_and_protects_saved_progress(store, users,
     assert store.get_progress(uid, document["id"]) is None
     store.remove_from_shelf(uid, document["id"])
     assert not store.is_on_shelf(uid, document["id"])
+
+
+def test_folder_and_book_shelves_are_independent_and_resume_is_private(store, users, document):
+    uid, other = users[0]["id"], users[1]["id"]
+    folder = store.register_document("library", "file:///books", "/books", title="My books", format="folder")
+    folder_key = folder_identity("library", "/books")
+    assert folder_key == folder_identity("library", "/books/./")
+    store.add_to_shelf(uid, folder["id"])
+    store.add_to_shelf(uid, folder["id"])
+    store.add_to_shelf(uid, document["id"])
+    assert len(store.list_bookshelf(uid)["items"]) == 2
+    assert store.list_bookshelf(other)["items"] == []
+    assert store.list_readings(uid)["items"] == []
+    assert store.get_progress(uid, folder["id"]) is None
+    assert store.get_folder_resume(uid, folder_key) is None
+
+    settings = store.get_settings(uid)
+    store.open_reading(uid, document["id"], settings["reading_epoch"], settings["progress_epoch"], folder_key)
+    store.save_progress(uid, document["id"], {"chunkIndex": 2}, 0, "tab", 1,
+                        settings["progress_epoch"], progress=35)
+    item = next(item for item in store.list_bookshelf(uid)["items"] if item["format"] == "folder")
+    assert item["document_id"] == folder["id"]
+    assert item["title"] == "My books"
+    assert item["resume_document_id"] == document["id"]
+    assert item["resume_title"] == "Book one"
+    assert item["progress"] == 35 and item["position"] == {"chunkIndex": 2}
+    store.add_to_shelf(other, folder["id"])
+    other_item = store.list_bookshelf(other)["items"][0]
+    assert other_item["resume_title"] is None and other_item["progress"] is None
+    with pytest.raises(NotFound):
+        store.remove_from_shelf(other, document["id"])
+
+    store.remove_from_shelf(uid, document["id"])
+    assert store.is_on_shelf(uid, folder["id"])
+    assert store.get_progress(uid, document["id"])["position"] == {"chunkIndex": 2}
+    store.clear_progress(uid)
+    assert store.get_folder_resume(uid, folder_key) is None
+    assert store.get_progress(uid, document["id"]) is None
+    assert store.is_on_shelf(uid, folder["id"])
+    assert store.list_bookshelf(uid)["items"][0]["resume_title"] is None
+    store.remove_from_shelf(uid, folder["id"])
+    assert store.is_on_shelf(other, folder["id"])
+
+
+@pytest.mark.parametrize("maintenance", ["cleanup", "cap"])
+def test_folder_shelf_protects_only_its_account_library_and_descendants(store, users, document, maintenance):
+    uid, other = users[0]["id"], users[1]["id"]
+    folder = store.register_document("library", "file:///books", "/books", title="My books", format="folder")
+    nested = store.register_document("library", "file:///books/part/two.txt", "/books/part/two.txt", title="Chapter two", format="txt")
+    sibling = store.register_document("library", "file:///books-other/one.txt", "/books-other/one.txt", format="txt")
+    foreign = store.register_document("other-library", "file:///books/one.txt", "/books/one.txt", format="txt")
+    folder_key = folder_identity("library", "/books")
+    store.add_to_shelf(uid, folder["id"])
+    for user_id in (uid, other):
+        settings = store.get_settings(user_id)
+        for ref, key in ((document, folder_key), (nested, folder_key),
+                         (sibling, folder_identity("library", "/books-other")),
+                         (foreign, folder_identity("other-library", "/books"))):
+            store.open_reading(user_id, ref["id"], settings["reading_epoch"], settings["progress_epoch"], key)
+            store.save_progress(user_id, ref["id"], {"chunkIndex": 3}, 0, "tab", 1,
+                                settings["progress_epoch"], progress=42)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("UPDATE reading_progress SET updated_at=0")
+        connection.execute("UPDATE folder_resume SET updated_at=0")
+        connection.execute("UPDATE reading_history SET last_opened_at=0")
+        connection.execute("UPDATE document_refs SET last_verified_at=0")
+
+    assert store.get_folder_resume(uid, folder_key)["last_document_id"] == nested["id"]
+    assert store.get_folder_resume(other, folder_key) is None
+    assert store.get_progress(uid, document["id"])["position"] == {"chunkIndex": 3}
+    assert store.get_progress(uid, nested["id"])["position"] == {"chunkIndex": 3}
+    assert store.get_progress(uid, sibling["id"]) is None
+    assert store.get_progress(uid, foreign["id"]) is None
+    assert store.get_progress(other, document["id"]) is None
+    if maintenance == "cleanup":
+        store.cleanup()
+    else:
+        with store._connection(write=True) as connection:
+            for user_id in (uid, other):
+                store._cap(connection, "reading_progress", user_id, "updated_at", 0)
+                store._cap(connection, "folder_resume", user_id, "updated_at", 0)
+    with sqlite3.connect(store.path) as connection:
+        assert set(connection.execute("SELECT user_id,document_id FROM reading_progress")) == {
+            (uid, document["id"]), (uid, nested["id"])}
+        assert connection.execute("SELECT user_id,folder_key FROM folder_resume").fetchall() == [(uid, folder_key)]
+    item = store.list_bookshelf(uid)["items"][0]
+    assert item["resume_title"] == "Chapter two"
+    assert item["progress"] == 42 and item["position"] == {"chunkIndex": 3}
+    assert opened(store, uid, document["id"])["progress"]["position"] == {"chunkIndex": 3}
 
 
 def test_expired_reads_and_progress_are_filtered_without_cleanup(store, users, document):

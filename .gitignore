@@ -43,4 +43,9 @@ pnpm-debug.log*
 *.sqlite3-*
 *.sqlite3.secret
 *.sqlite3.lock
+
+# Private registration settings and atomic-write / lock sidecars (any DB name).
+*.registration.json
+*.registration.json.*
+*.registration.lock
 test-results/

@@ -1,258 +1,231 @@
-============
-Recoll WebUI
-============
+=================
+Recoll 文库 WebUI
+=================
 
-This (https://framagit.org/medoc92/recollwebui) is an updated clone of
-Koniu's original version on GitHub (https://github.com/koniu/recoll-webui),
-which has not been updated lately, and is now slightly obsolete. If you are currently
-on github, you are viewing a mirror of the framagit repo (you're fine :) ).
+基于 Recoll 全文索引的私有文库与浏览器阅读应用，适合检索、收藏和连续阅读本地小说、电子书及文档。
+后端使用 Python、Bottle、Waitress 和 SQLite，前端提供中文界面及手机、桌面布局。
 
-As compared to the original, this version has an additional dependency when
-running the webui-standalone.py server (i.e. not with apache): it uses the
-python3-waitress module which must be installed. This makes
-webui-standalone suitable for moderate multiaccess loads. Local accounts now
-protect searches, documents and exports; every account shares the document
-library and keeps its own bookshelf, history, preferences and reading progress.
+本仓库是 `uiharuayako/recollwebui-novel <https://github.com/uiharuayako/recollwebui-novel>`_，
+在 `medoc92/recollwebui <https://framagit.org/medoc92/recollwebui>`_ 的搜索界面基础上加入账号、书架和阅读功能。
+所有账号共享部署者配置的文库，各自保存收藏、偏好、历史与阅读位置。
+Recoll 负责索引与检索；本应用不创建或管理 Recoll 索引，也不提供文档上传。
 
-An updated version of the original doc follows.
+主要功能
+========
 
+* **全文搜索**：支持 Recoll 查询语法、目录和日期筛选、排序、分页、命中摘要，以及 CSV / JSON 导出。
+  搜索结果可查看命中、阅读整个文件夹、单独阅读、下载、加入书架或分享。
+* **个人书架**：收藏单本或整个文件夹，切换网格与列表布局，显示已同步进度并继续阅读。
+  文件夹收藏会恢复上次阅读的文件及位置；书架的标题筛选只作用于当前页。
+* **连续阅读**：TXT、EPUB、HTML 和 PDF 提供连续纵向滚动；阅读器包含目录、书单、书内搜索、
+  全屏、专注模式及快捷键帮助。可调整主题、字体、字号、行距、段距、宽度和缩进。
+* **阅读同步**：按账号保存阅读位置与排版偏好，在换书或页面隐藏时补交位置。
+  多设备位置冲突提供明确选择；临时查看搜索命中时保留原来的阅读位置。
+* **首页发现**：展示继续阅读、个人搜索推荐和每日推荐。搜索推荐可手动管理，候选池最多 60 条；
+  每日推荐从允许访问的文库抽取最多 6 本，按北京时间每天更新。
+* **账号管理**：管理员可创建、停用、重置或删除账号，管理注册开关和可选的激活码。
+  注册默认关闭，不需要邮箱。用户可改密、撤销登录设备并控制个人记录开关。
+* **公开分享**：分享单本或文件夹，链接持有人无需登录即可阅读。默认有效期 7 天，可设为 1–3650 天，
+  并在“我的分享”中续期或取消。匿名阅读不会写入账号的书架、历史或进度。
 
-**Recoll WebUI** is a Python-based web interface for the **Recoll** text search
-tool for Unix/Linux.
+支持的阅读格式
+==============
 
-.. image:: http://i.imgur.com/n8qTnBg.png
+* 文本与网页：TXT、Markdown、HTML / HTM / XHTML、XML、MHTML。
+* 电子书与文档：EPUB、MOBI、AZW / AZW3、FB2、CHM、DOCX、PDF。
+* 漫画归档：CBZ、CBR、CBT、CB7。
 
-* WebUI homepage: https://framagit.org/medoc92/recollwebui
-* Recoll homepage: http://www.lesbonscomptes.com/recoll
-* Original WebUI homepage: https://github.com/koniu/recoll-webui
+TXT 使用服务端分块缓存与标题目录，EPUB 按章节加载；两者只挂载阅读位置附近的内容。
+PDF 使用仓库内置的 Mozilla PDF.js，支持可选文本、目录、搜索高亮、缩放和旋转。
+扫描 PDF 需要先有 OCR 文本层才能搜索文字。
+CHM 需要系统提供 ``7z`` 命令，解包后在隔离沙箱内加载原页面，兼容书内脚本、目录及嵌套页面。
+其他格式使用内置的 Kookit 阅读运行时，实际排版与定位能力随格式而异。
 
-Requirements
-============
+文件夹阅读最多扫描 1000 本可阅读文件，包含子目录。
+Recoll 容器内部的 ``ipath`` 条目仍可使用搜索预览与下载，不支持直接进入阅读器。
+文档移动后不会自动追踪；已失效或移出允许目录的文档需要重新检索。
 
-All you need to use the WebUI is:
+安装与首次运行
+==============
 
-* Python 3.
-* The Python waitress package. You can remove this dependence and run with
-  the internal bottle server by editing webui-standalone.py
-* Recoll 1.20+ and the Recoll Python3 extension (e.g. the python3-recoll package on Debian-derived
-  systems).
-* ``argon2-cffi`` for password hashing (install ``requirements.txt``).
-* A WEB browser
+依赖
+----
 
-Installation and Usage on MS-Windows
-====================================
+* Linux、Python 3，以及系统安装的 Recoll、``recollindex`` 和 Recoll Python 扩展。
+  Recoll 不是 pip 依赖；运行应用的解释器必须能导入 ``recoll``、``rclextract``、``rclconfig``。
+* ``requirements.txt`` 中的 ``argon2-cffi`` 和 ``waitress``；Bottle 已随仓库提供。
+* 支持 ES modules 的现代浏览器；CHM 另需 ``7z``。
+* Node.js 仅用于 JavaScript 测试和重新构建前端依赖，正常部署无需安装。
 
-We have a `separate Web page <https://www.lesbonscomptes.com/recoll/faqsandhowtos/webui-on-windows.html>`_ for this.
+准备索引
+--------
 
-Installation and Usage on Linux
-===============================
+先通过 Recoll 配置文库根目录（``recoll.conf`` 中的 ``topdirs``），并建立索引。
+以下命令中的路径应替换为自己的 Recoll 配置目录::
 
-**Recoll WebUI** can be used as a standalone application or through a web server via
-WSGI/CGI. Regardless of the mode of operation you need Recoll to be configured on your system as the
-WebUI only provides a front-end for searching and does not handle index configuration etc.
+    recollindex -c /path/to/recoll-config
 
-Run standalone
+服务账号需要能够读取配置、索引与原始文档。索引更新也由部署者安排，例如定时运行同一命令。
+搜索范围和可读取文件由这些 Recoll 配置共同决定，各账号使用相同文库范围。
+
+安装并初始化账号
+----------------
+
+在已安装系统 Recoll Python 扩展的解释器上创建虚拟环境，保留系统包访问::
+
+    git clone https://github.com/uiharuayako/recollwebui-novel.git
+    cd recollwebui-novel
+    python3 -m venv --system-site-packages .venv
+    . .venv/bin/activate
+    python -m pip install -r requirements.txt
+    python -c "from recoll import recoll, rclextract, rclconfig"
+
+以实际运行服务的操作系统账号初始化数据库::
+
+    export RECOLL_WEBUI_DB_PATH="$HOME/.local/share/recoll-webui/app.sqlite3"
+    python manage.py init --username admin
+
+命令会交互式要求输入 15–128 个字符的密码。首次登录管理员账号后必须改密，再重新登录。
+数据库未初始化时，应用返回设置错误，不会开放匿名文库访问。
+
+数据库应位于本机私有持久目录，放在源码、静态资源和文库目录之外。
+初始化会生成数据库和同目录的 ``app.sqlite3.secret`` 签名密钥；所有本机工作进程需要共享同一组文件。
+后续管理命令和服务始终使用相同的 ``RECOLL_WEBUI_DB_PATH``。
+
+启动
+----
+
+在同一虚拟环境和环境变量下运行::
+
+    python webui-standalone.py -c /path/to/recoll-config
+
+默认访问 http://127.0.0.1:8080/。常用参数：
+
+* ``-a / --addr``：监听地址，默认 ``127.0.0.1``；局域网部署可设为 ``0.0.0.0``。
+* ``-p / --port``：端口，默认 ``8080``。
+* ``-t / --threads``：Waitress 工作线程数，默认 ``8``。
+* ``-c / --config``：Recoll 配置目录，优先于 ``RECOLL_CONFDIR``。
+
+更多选项可运行 ``python webui-standalone.py --help``。
+长期运行可使用 `systemd 部署说明 <README-systemd.rst>`_ 和 ``examples/recoll-webui.service``；
+部署前调整账号、解释器、代码路径、Recoll 配置和数据库路径。
+WSGI 入口为 ``webui-wsgi.py`` 中的 ``application``，同样需要预先初始化账号并配置这些路径。
+
+配置
+====
+
+环境变量
+--------
+
+``RECOLL_CONFDIR``
+    主 Recoll 配置目录；不指定时由 Recoll 使用默认配置。
+``RECOLL_EXTRACONFDIRS``
+    同时查询的其他 Recoll 配置目录，以空格分隔；包含空格的路径需在变量值中加引号。
+``RECOLL_WEBUI_DB_PATH``
+    SQLite 数据库绝对路径，默认 ``~/.local/share/recoll-webui/app.sqlite3``，其中 ``~`` 属于服务账号。
+``RECOLL_WEBUI_TRUSTED_PROXIES``
+    可信反向代理的 IP / CIDR，以空格或逗号分隔。只有这些代理可提供客户端地址和 HTTPS 转发信息。
+``RECOLL_WEBUI_COOKIE_SECURE``
+    默认 ``auto``，根据请求协议设置 Secure Cookie；HTTPS-only 部署可设为 ``true``。
+``RECOLL_TMPDIR``
+    临时文件及阅读缓存根目录，未设置时使用 ``TMPDIR`` 或系统临时目录；需给服务账号写权限并预留空间。
+
+搜索设置
+--------
+
+用户在“搜索设置”中保存个人偏好；部署者可在主 ``recoll.conf`` 中设置初始值，例如::
+
+    webui_maxresults = 500
+    webui_perpage = 500
+    webui_dirdepth = 2
+    webui_context = 30
+    webui_maxchars = 500
+
+``webui_maxresults`` 是总结果数，``0`` 表示不限；``webui_perpage`` 单独控制分页。
+已有个人偏好优先于初始值。目录特别多时，可降低 ``webui_dirdepth``，减少目录树构建开销。
+常用的其他配置包括 ``webui_stem``、``webui_collapsedups``、``webui_defaultsort``、
+``webui_csvfields``、``webui_synonyms`` 和追加到全部查询的 ``webui_queryfrag``。
+
+服务端限制使用 ``webui_nosettings = 1`` 锁定搜索展示偏好，
+``webui_maxperpage`` 限制每页数量，``webui_nojsoncsv = 1`` 关闭 CSV / JSON 导出。
+这些设置不影响改密、设备撤销和个人历史删除。
+原文件链接可通过 ``webui_mount_/server/path`` 替换路径；浏览器阅读和下载无需配置客户端本地挂载。
+
+HTTPS 与子路径
 --------------
 
-Install dependencies and initialize the account database as the operating-system
-user that will run the application::
+对外访问时，在 Waitress / WSGI 前配置 HTTPS 反向代理，并把实际代理地址加入
+``RECOLL_WEBUI_TRUSTED_PROXIES``，由代理传递 ``X-Forwarded-Proto`` 和 ``X-Forwarded-For``。
+WSGI 服务器也必须信任该代理，并将外部 HTTPS 正确传递为 ``wsgi.url_scheme=https``。
+当前 standalone 使用的 Waitress 默认清理未受信的转发头，仅设置应用的可信代理变量不足以完成 HTTPS 反代配置；
+此类部署应使用在服务器层配置了代理信任的 WSGI 入口。
+子路径部署使用 WSGI ``SCRIPT_NAME``，页面、API、静态资源与 Cookie 会使用相应前缀。
 
-    python3 -m pip install -r requirements.txt
-    export RECOLL_WEBUI_DB_PATH=/absolute/private/directory/app.sqlite3
-    python3 manage.py init --username admin
+退出、改密、停用、密码重置和角色调整会撤销相关登录会话。
+公开分享链接独立于创建者的登录会话；到期、取消或停用所有者后，后续正文与资源请求也会失效。
+链接持有人拥有对应单本或文件夹的阅读权限，分享文件夹时其可阅读内容会随目录更新。
 
-The management command prompts for a 15–128 character password. The first login
-requires changing that initial password. The database and its ``.secret`` signing
-key must persist between restarts and be shared by all local workers. An
-uninitialized application returns a setup error instead of enabling anonymous
-access. Recoll remains a system dependency; a virtual environment must be able to
-import its Python extension.
+账号、数据与维护
+================
 
-Run ``webui-standalone.py`` and connect to ``http://localhost:8080``. Use the same
-``RECOLL_WEBUI_DB_PATH`` for the management commands and the server.
+管理员可在“账号管理”中开放注册、要求激活码或更换激活码。
+注册配置保存在数据库旁的 ``app.sqlite3.registration.json``，只保存激活码哈希；配置不存在时注册关闭。
+数据库、签名密钥和注册配置都应保留在部署环境中，实际密码和激活码不要写入源码。
 
-See `account, bookshelf and history operations <docs/accounts-and-history.md>`_
-for setup, backup, recovery, retention and verification details.
+默认保留规则：搜索历史 90 天 / 500 次，最近阅读 180 天 / 1000 篇，
+非书架阅读进度与目录续读 365 天 / 1000 项。
+书架内容及其对应进度受收藏保护；移出书架保留历史和位置，清空历史保留书架。
+搜索历史、最近阅读与进度同步可分别开关。
 
-There's some optional command-line arguments available::
+以服务账号、相同数据库路径执行维护命令::
 
-    -h, --help            show this help message and exit
-    -a ADDR, --addr ADDR  address to bind to [127.0.0.1]
-    -p PORT, --port PORT  port to listen on [8080]
-    -t THREADS, --threads THREADS
-                          number of server worker threads [8]. Building the result
-                          snippets is cpu intensive, so a few extra workers keep
-                          concurrent requests (page assets, second tab) from being
-                          served only when a search has finished
-    -c CONFDIR, --config CONFDIR Recoll configuration directory to use
+    python manage.py create-user reader --display-name 读者
+    python manage.py reset-password admin --enable --admin
+    python manage.py cleanup
+    python manage.py backup /private/backups/recoll-backup.sqlite3
 
-The standalone application can be configured to run automatically using systemd. See the file
-`README-systemd.rst <README-systemd.rst>`_.
+备份目标必须尚不存在，另行备份签名密钥和注册配置；原文档与 Recoll 索引分别备份。
+恢复前停止全部 standalone / WSGI 工作进程，再执行::
 
-Environment variables:
+    python manage.py restore /private/backups/recoll-backup.sqlite3 --workers-stopped
 
-- `RECOLL_CONFDIR` the recoll configuration directory. This is overriden by a -c option.
-- `RECOLL_EXTRACONFDIRS` a space-separated list of external indexes to query in addition to the main
-  one.
-- ``RECOLL_WEBUI_DB_PATH`` the local persistent SQLite database; defaults to
-  ``~/.local/share/recoll-webui/app.sqlite3`` for the service user.
-- ``RECOLL_WEBUI_TRUSTED_PROXIES`` explicitly trusted proxy IP addresses/CIDRs
-  (space or comma separated). Only these proxies may supply forwarded address and
-  HTTPS information.
-- ``RECOLL_WEBUI_COOKIE_SECURE`` defaults to ``auto``; set ``true`` for an
-  HTTPS-only deployment.
+已有部署升级前先备份并停止工作进程，再安装依赖和更新代码。
+当前 schema 为 v1，分享和搜索推荐表在首次使用时增量创建，已有数据库无需重新初始化。
+详细的数据保留、恢复、注册、代理和权限说明见 `账号与阅读功能文档 <docs/accounts-and-history.md>`_。
 
+开发与验证
+==========
 
-Run as WSGI/CGI
----------------
+在能导入系统 Recoll 扩展的虚拟环境中运行::
 
-See the following link for a complete run-through:
+    python -m pip install -r requirements-dev.txt
+    python -m pytest -q tests
+    node --test tests/*.test.mjs
 
-https://www.lesbonscomptes.com/recoll/pages/recoll-webui-install-wsgi.html
+集成测试建立临时 Recoll 索引和 SQLite 数据库，不连接正在运行的服务。
+浏览器测试使用 Playwright 和 Chromium，未找到浏览器时跳过；可通过 ``RECOLL_TEST_CHROMIUM`` 指定可执行文件。
+真实 CHM 样本检查另需 ``RECOLL_TEST_CHM_MANIFEST`` 指向已有解包缓存的 ``manifest.json``。
+运行全部 CHM 检查还需要 ``7z``。
 
-Example WSGI/Apache2 config, assuming that the code is in /var/recoll-webui-master::
+主要代码位置：
 
-        WSGIDaemonProcess recoll user=recoll group=recoll threads=5 display-name=%{GROUP} python-path=/var/recoll-webui-master
-        WSGIScriptAlias /recoll /var/recoll-webui-master/webui-wsgi.py
-        <Directory /var/recoll-webui-master>
-                WSGIProcessGroup recoll
-                Order allow,deny
-                allow from all
-        </Directory>
+* ``webui.py``：Recoll 搜索、文档预览与下载、阅读器内容及缓存。
+* ``accounts.py`` / ``account_web.py``：SQLite、认证、个人设置和账号管理。
+* ``webui_data.py`` / ``shares.py``：书架、历史、进度、推荐与公开分享。
+* ``views/`` / ``static/``：Bottle 模板、文库交互及阅读器。
+* ``manage.py`` / ``examples/``：初始化、备份恢复、清理和 systemd 示例。
 
-Remarks:
+阅读器静态依赖已提交到仓库，运行时不从 CDN 下载。
+PDF.js 的版本、许可证与构建命令见 `PDF.js 运行时说明 <vendor-build/pdfjs/README.md>`_；
+界面设计参考与验证范围见 `UI/UX 调研记录 <docs/reader-ui-research.md>`_。
+``docs/local-deployment.md`` 记录维护者本机部署，通用部署请使用上面的步骤。
 
-* Without "python-path=" you might see errors that it can't import webui 
-* Run the WSGIDaemonProcess run under the username (user=xyz) of the user
-  that you want to have exposed via web.
+项目来源
+========
 
-
-User configuration defaults
----------------------------
-
-New on 2022-06-15.
-
-There are a number of parameters with initial defaults which the user can change through a Web
-interface page (by clicking the `Settings` button), and which are persisted in a cookie.
-
-Some of the initial defaults may not be appropriate for your configuration. For example the default
-depth of 2 for building the directory selection tree may be too much on a big data set (and cause
-initialisation errors).
-
-The initial defaults can be changed by setting values in the main recoll configuration file
-($RECOLL_CONFDIR/recoll.conf):
-
-- webui_context (30) the size of the abstract snippets in words.
-- webui_maxchars (500) total maximum size for the abstract shown with each result.
-- webui_stem (1) queries will use stemming (or not).
-- webui_timefmt ("%c") format of the time display.
-- webui_dirdepth (2) depth of the directory selection tree. Beware if your data set has many
-  directories.
-- webui_maxresults (500) default limit on the total number of results. Users can change this in
-  Settings (0 means no limit).
-- webui_perpage (500) number of results per page.
-- webui_csvfields ("filename title author size time mtype url") fields extracted in CSV or JSON dumps.
-- webui_title_link ("download") action performed if you click the result title (or 'open',
-  'preview').
-- webui_mount_MOUNTNAME (``file://MOUNTNAME``) location replacement for mount points. e.g.::
-
-    webui_mount_/server/path = file:///local/client/path
-
-  This is only really usable if ``webui_nosettings`` is also set, because, otherwise, the cookie
-  value will override the server setting.
-  
-The following are not changeable from the user interface:
-
-- webui_nojsoncsv (0) If set, disable downloading results as JSON or CSV.
-- webui_maxperpage (0) If set to non-zero, limits the maximum value of results per page settable
-  through the UI.
-- webui_nosettings (0) do not show settings options to users.
-- webui_defaultsort ("Relevancy") default sort field.
-- webui_synonyms ("") absolute path to a Recoll synonyms file. Note that the optional Recoll
-  `idxsynonyms` value should be the same string if it is to be used.
-- webui_shortenpaths (1) shorten the folder paths shown in the result list by removing the common
-  prefix. The default is to do it, set to 0 to show complete paths.
-- webui_permlinks (0) add the Recoll `rcludi` unique identifier to Preview and Download links so that
-  they become stable and bookmarkable.
-- webui_res_permlink (0) add a stable link to the result itself (right of `Preview` and `Download`).
-- webui_queryfrag query fragment to append to all user queries (e.g.: -mime:inode/directory to not
-  show results which are actually folders).
-
-Reading documents in the browser
---------------------------------
-
-The reader keeps TXT, EPUB, HTML and PDF documents in a continuous vertical
-scrolling view, including on phones. The compact toolbar provides a collapsible
-navigation panel with separate contents, book list and full-book search tabs.
-PDF pages retain selectable text, links, outline navigation, highlighted search,
-zoom and rotation through the locally bundled Mozilla PDF.js viewer components.
-
-Reading settings include light, warm-paper, dark and system themes, font family
-and size, line height, paragraph spacing, content width, alignment and indentation.
-Publisher typography can be retained. Settings belong to the signed-in account.
-Text anchors preserve the visible passage when the layout changes; older saved
-positions remain supported. Images open in an enlarged view and footnotes open
-in a small dialog without leaving the current passage.
-
-Search results offer separate actions to inspect a match or resume reading.
-Inspecting a match temporarily preserves the original reading position; use
-the return action or explicitly continue from the inspected position. Ctrl/Cmd+F
-opens full-book search, Page Up/Down or Space scrolls, and H toggles the toolbar.
-TXT headings are indexed when the text cache is built, so opening the contents
-does not download the entire book to the browser. EPUB and TXT continue to mount
-only the surrounding chapters or chunks.
-
-The interface takes inspiration from `Readest <https://github.com/readest/readest>`_
-(quiet reading surface, separate navigation and typography controls) and
-`Koodo Reader <https://github.com/koodo-reader/koodo-reader>`_ (reading controls
-and document navigation). The layout and reader integration
-are implemented for this application. PDF rendering uses the pinned upstream
-`PDF.js <https://github.com/mozilla/pdf.js>`_ components with their bundled license;
-see ``vendor-build/pdfjs/README.md`` for reproducible asset builds.
-
-Running the indexer
--------------------
-
-Example user Crontab entry to have the indexer at least once a day::
-
-        22 5    * * *   /usr/bin/recollindex
-
-
-
-Issues
-======
-
-Can't open files when Recoll WebUI is running on a server
----------------------------------------------------------
-By default links to files in the result list correspond to the file's
-physical location on the server. If you have access to the file tree
-via a local mountpoint or eg. ftp/http you can provide replacement
-URLs in the WebUI settings. If in doubt, ask your network administrator.
-
-Opening files via local links
------------------------------
-For security reasons modern browsers prevent linking to local content from
-'remote' pages. As a result URLs starting with file:// will not, by default,
-be opened when linked from anything else than pages in file:// or when
-accessed directly from the address bar. Here's ways of working around it:
-
-Firefox
-~~~~~~~
-1. Insert contents of ``examples/firefox-user.js`` into
-   ``~/.mozilla/firefox/<profile>/user.js``
-2. Restart Firefox
-
-Chrom{e,ium}
-~~~~~~~~~~~~
-Install *LocalLinks* extension:
-
-* http://code.google.com/p/locallinks/
-* https://chrome.google.com/webstore/detail/locallinks/jllpkdkcdjndhggodimiphkghogcpida
-
-Opera
-~~~~~
-1. Copy ``examples/opera-open.sh`` into your PATH (eg. ``/usr/local/bin``)
-2. Go to ``Tools > Preferences > Advanced > Programs > Add``
-3. In ``Protocol`` field enter ``local-file``
-4. Select ``Open with other application`` and enter ``opera-open.sh``
-5. In WebUI settings replace all ``file://`` with ``local-file://``
+* `Recoll <https://www.recoll.org/>`_ 提供全文索引与检索。
+* `medoc92/recollwebui <https://framagit.org/medoc92/recollwebui>`_ 是本项目的直接上游，
+  更早源自 `koniu/recoll-webui <https://github.com/koniu/recoll-webui>`_。
+* 多格式阅读使用 `Koodo Reader / Kookit <https://github.com/koodo-reader/koodo-reader>`_ 运行时，
+  PDF 渲染使用 `Mozilla PDF.js <https://github.com/mozilla/pdf.js>`_；随附资源保留各自许可信息。
+* 界面与交互参考 Readest、Koodo Reader 等开源阅读器，具体来源见上述调研记录。

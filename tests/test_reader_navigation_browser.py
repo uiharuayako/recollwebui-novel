@@ -68,3 +68,48 @@ def test_navigation_matches_inline_text_and_restores_temporary_location():
         assert result['temporary'] and result['canReturn'] and result['highlighted']
         assert result['restored'] == 0 and result['returned'] and result['bannerHidden']
         browser.close()
+
+
+@pytest.mark.parametrize('frame_height,last_heading_top', [(1000, 900), (300, 200)])
+def test_adjacent_navigation_keeps_directory_targets_that_cannot_reach_viewport_top(frame_height, last_heading_top):
+    chromium = os.environ.get('RECOLL_TEST_CHROMIUM') or shutil.which('chromium') or shutil.which('google-chrome')
+    if not chromium:
+        pytest.skip('Set RECOLL_TEST_CHROMIUM to run browser checks')
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True, executable_path=chromium, args=['--no-sandbox'])
+        page = browser.new_page()
+
+        def route(request):
+            if request.request.url.endswith('/navigation.js'):
+                request.fulfill(content_type='text/javascript', body=(ROOT / 'static/reader/navigation.js').read_text())
+            else:
+                request.fulfill(content_type='text/html', body=f'''<!doctype html><html><body>
+                  <div id="reader-toc-list"></div>
+                  <div id="stage" style="height:500px;overflow:auto"><iframe id="content" style="height:{frame_height}px;width:600px;border:0"></iframe></div>
+                  </body></html>''')
+
+        page.route('http://recoll.test/**', route)
+        page.goto('http://recoll.test/')
+        result = page.evaluate('''async (headingTop) => {
+          const {ReaderNavigation, scrollToTextMatch} = await import('/navigation.js');
+          const frame = document.getElementById('content'), stage = document.getElementById('stage'), doc = frame.contentDocument;
+          doc.open(); doc.write(`<body style="margin:0"><h1 style="margin:0">First</h1><h2 style="position:absolute;top:${headingTop}px;margin:0">Last</h2></body>`); doc.close();
+          const calls = [];
+          const nav = new ReaderNavigation({getContext: () => ({format:'html',stage,documents:[{document:doc,index:0,frame}]}),
+            onNavigate:(target) => {calls.push(target.label);scrollToTextMatch(doc,target,stage,frame);}});
+          await nav.refresh();
+          await nav.navigate(nav.outline[1]); nav.updateActiveHeading();
+          const lastActive = nav.activeOutlineIndex;
+          await nav.navigateAdjacent(-1); nav.updateActiveHeading();
+          const firstActive = nav.activeOutlineIndex;
+          await nav.navigateAdjacent(1); nav.updateActiveHeading();
+          const lastAgain = nav.activeOutlineIndex, scrollable = stage.scrollTop > 0;
+          stage.scrollTop = 0; nav.updateActiveHeading();
+          return {lastActive, firstActive, lastAgain, calls, scrollable, afterScroll:nav.activeOutlineIndex};
+        }''', last_heading_top)
+        assert result['lastActive'] == result['lastAgain'] == 1
+        assert result['firstActive'] == 0
+        assert result['calls'] == ['Last', 'First', 'Last']
+        if result['scrollable']:
+            assert result['afterScroll'] == 0
+        browser.close()

@@ -1,5 +1,6 @@
 %include('header', title=' / 修改密码')
-<main class="account-page account-narrow">
+<main id="main-content" tabindex="-1" class="account-page account-narrow">
+  <p class="account-eyebrow">ACCOUNT SECURITY</p>
   <h1>修改密码</h1>
   %if forced:
   <p class="account-notice" role="status">请先更换初始密码，再访问文档库。</p>

@@ -1,19 +1,34 @@
 %include('header', title=' / 账号管理')
-<main class="account-page">
+<main id="main-content" tabindex="-1" class="account-page">
+  <p class="account-eyebrow">LIBRARY MEMBERS</p>
   <h1>账号管理</h1>
   <p class="account-muted">管理员管理账号，所有账号共享文档库。此处不提供其他账号的个人历史。</p>
   %if saved:
   <p class="account-notice" role="status">账号操作已完成；角色、状态或密码变更后，相关账号需重新登录。</p>
   %end
+  %if registration_saved:
+  <p class="account-notice" role="status">注册设置已保存。</p>
+  %end
   <section class="account-card">
     <h2>创建账号</h2>
     <form method="post" action="{{app_url('/admin/users')}}" class="account-form">
       <input type="hidden" name="csrf" value="{{account_csrf()}}">
-      <label>用户名<input name="username" required pattern="[A-Za-z0-9._-]{3,32}" maxlength="32" autocomplete="off"><small>3–32 位英文字母、数字或 . _ -，不区分大小写。</small></label>
+      <label>用户名<input name="username" required pattern="[A-Za-z0-9._\-]{3,32}" maxlength="32" autocomplete="off"><small>3–32 位英文字母、数字或 . _ -，不区分大小写。</small></label>
       <label>显示名称<input name="display_name" maxlength="100"></label>
       <label>角色<select name="role"><option value="member">普通用户</option><option value="admin">管理员</option></select></label>
       <label>初始密码<input type="password" name="password" required minlength="15" maxlength="128" autocomplete="new-password"><small>用户首次登录时必须更换。</small></label>
       <button type="submit">创建账号</button>
+    </form>
+  </section>
+  <section class="account-card">
+    <h2>用户注册</h2>
+    <p class="account-muted">用户使用用户名和密码注册，无需邮箱验证；新注册的账号为普通用户。</p>
+    <form method="post" action="{{app_url('/admin/registration')}}" class="account-form">
+      <input type="hidden" name="csrf" value="{{account_csrf()}}">
+      <label class="account-check"><input name="enabled" value="1" type="checkbox" {{'checked' if registration['enabled'] else ''}}>开放用户注册</label>
+      <label class="account-check"><input name="activation_required" value="1" type="checkbox" {{'checked' if registration['activation_required'] else ''}}>注册时需要激活码</label>
+      <label>设置新激活码<input type="password" name="activation_code" maxlength="128" autocomplete="new-password"><small>{{'已设置激活码。' if registration['activation_code_set'] else '尚未设置激活码。'}}留空保留现有激活码；已保存的激活码无法查看，可在此替换。</small></label>
+      <button type="submit">保存注册设置</button>
     </form>
   </section>
   <section class="account-card"><h2>现有账号</h2>

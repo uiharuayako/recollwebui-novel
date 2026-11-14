@@ -313,6 +313,9 @@ test('reader overrides vendor mobile script defaults before rendering and ignore
   const render = app.indexOf('await rendition.renderTo(stage)', create);
   assert.ok(create >= 0 && disable > create && render > disable);
   assert.equal(app.includes('localStorage'), false);
-  assert.equal(app.includes('allow-scripts'), false);
+  // Native CHM scripts use an opaque frame; converted vendor documents still
+  // keep scripts disabled and no frame combines scripts with same-origin.
+  assert.match(app, /setAttribute\('sandbox', manifest\.renderBaseUrl \? 'allow-scripts' : 'allow-same-origin'\)/);
+  assert.doesNotMatch(app, /allow-scripts allow-same-origin|allow-same-origin allow-scripts/);
   assert.match(app, /import\('\.\/kookit\.bundle\.js'\)/);
 });

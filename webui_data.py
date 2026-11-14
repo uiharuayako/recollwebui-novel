@@ -3,6 +3,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import random
 import re
 import sqlite3
 from types import SimpleNamespace
@@ -10,7 +11,7 @@ from urllib.parse import urlencode, quote, urlsplit
 
 import bottle
 import account_web as auth
-from accounts import ConflictError, NotFound, ValidationError
+from accounts import ConflictError, NotFound, ValidationError, folder_identity, folder_name
 
 
 SEARCH_FIELDS = ('query', 'dir', 'before', 'after', 'sort', 'ascending')
@@ -142,16 +143,91 @@ class ApplicationData:
             query['search_id'] = replay_event['id']
         bottle.redirect(auth.app_url('/results') + '?' + urlencode(query), 303)
 
-    def finish_search(self, event, query, config, result_count):
+    def finish_search(self, event, query, config, result_count, recommendation_ids=None):
         if not event:
             return
         try:
             self.store.complete_search(
                 auth.current_user()['id'], event['id'],
                 {k: query[k] for k in SEARCH_FIELDS},
-                {k: config[k] if k in config else query[k] for k in SEARCH_SETTINGS}, result_count)
+                {k: config[k] if k in config else query[k] for k in SEARCH_SETTINGS}, result_count,
+                recommendation_ids=recommendation_ids)
         except sqlite3.Error:
-            bottle.request.environ['recoll.notice'] = '搜索已完成，本次历史尚未保存。'
+            bottle.request.environ['recoll.notice'] = '搜索已完成，本次历史与搜索推荐尚未保存。'
+
+    def recommendation_card(self, document, source_query=''):
+        return {
+            'document_id': document['id'], 'title': document['title'],
+            'format': document['format'], 'source_query': source_query,
+            'folder_name': folder_name(document['source_path']),
+            'recommendation_handle': auth.sign_payload({'document_id': document['id']}, 'recommendation-add'),
+        }
+
+    def search_recommendations(self, config):
+        uid = auth.current_user()['id']
+        candidates = []
+        for item in self.store.list_recommendations(uid, library_key=self.scope(config)):
+            try:
+                document = self.document(item['document_id'], config)
+            except (NotFound, ValidationError, OSError):
+                continue
+            if document['format'] in self.webui.READER_SUPPORTED_FORMATS:
+                candidates.append(self.recommendation_card(document, item['source_query']))
+        return candidates
+
+    def daily_recommendations(self, config, day):
+        # Seek randomly into the complete index, without generating excerpts or
+        # using the user's search result/page limits or personal history.
+        mime_types = sorted({FORMAT_MIME[fmt] for fmt in self.webui.READER_SUPPORTED_FORMATS if fmt in FORMAT_MIME})
+        query_spec = {
+            'query': '(' + ' OR '.join('mime:"%s"' % mime for mime in mime_types) + ')',
+            'dir': '<all>', 'before': '', 'after': '', 'sort': 'relevancyrating', 'ascending': 0,
+        }
+        # Relevance order avoids sorting the whole library by file path. Fixed
+        # search options keep the daily draw independent of account preferences.
+        daily_config = dict(config, stem=0, collapsedups=0)
+        query, database, _ = self.webui.recoll_initsearch(query_spec, daily_config)
+        generator = random.Random(day + ':' + self.scope_version(config))
+        offsets = generator.sample(range(query.rowcount), min(query.rowcount, 48))
+        items, seen = [], set()
+        for offset in offsets:
+            if type(query.next) == int:
+                query.next = offset
+            else:
+                query.scroll(offset, mode='absolute')
+            doc = query.fetchone()
+            if doc is None or getattr(doc, 'ipath', ''):
+                continue
+            try:
+                document = self.register_doc(doc, config)
+            except (NotFound, ValidationError, OSError):
+                continue
+            if document['format'] not in self.webui.READER_SUPPORTED_FORMATS or document['id'] in seen:
+                continue
+            seen.add(document['id'])
+            items.append(self.recommendation_card(document))
+            if len(items) == 6:
+                break
+        return items
+
+    def change_recommendation(self, saved, api=False):
+        data = request_json() if api else bottle.request.forms.decode('utf-8')
+        uid = auth.current_user()['id']
+        if saved:
+            context = auth.read_payload(data.get('handle', ''), 'recommendation-add')
+            if not context:
+                bottle.abort(403, '推荐操作已失效，请刷新后重试')
+            document = self.document(context['document_id'])
+            if document['format'] not in self.webui.READER_SUPPORTED_FORMATS:
+                raise ValidationError('该文档暂不支持推荐阅读')
+            document_id = document['id']
+            self.store.add_recommendations(uid, [document_id], data.get('source_query', ''))
+        else:
+            document_id = data.get('document_id', '')
+            self.store.remove_recommendation(uid, document_id)
+        if api:
+            return json_response({'saved': saved, 'document_id': document_id})
+        bottle.redirect(auth.safe_next(data.get('next', auth.app_url('/#search-recommendations'))), 303)
 
     def version(self, path):
         stat = os.stat(path)
@@ -181,16 +257,36 @@ class ApplicationData:
             config=config, ipath=getattr(doc, 'ipath', '') or '',
             rcludi=getattr(doc, 'rcludi', '') or '')
 
-    def document(self, document_id, config=None, allow_container=False):
+    def register_folder(self, root, config=None):
+        config = config or self.webui.get_config()
+        root = os.path.realpath(root)
+        if not self.webui.is_allowed_reader_path(root, config) or not os.path.isdir(root):
+            raise NotFound('文件夹不可用')
+        ref = self.store.register_document(
+            self.scope(config), 'file://' + quote(root, safe='/'), root,
+            title=os.path.basename(root) or root, format='folder')
+        ref['folder_name'] = folder_name(root)
+        return ref
+
+    def document(self, document_id, config=None, allow_container=False, allow_folder=False):
         config = config or self.webui.get_config()
         doc = self.store.get_document(document_id)
-        if (not doc or doc['library_key'] != self.scope(config) or
+        is_folder = doc['format'] == 'folder'
+        if (doc['library_key'] != self.scope(config) or
                 not self.webui.is_allowed_reader_path(doc['source_path'], config) or
-                not os.path.isfile(doc['source_path'])):
-            raise NotFound('文档不可用')
+                (is_folder and not allow_folder) or
+                not (os.path.isdir(doc['source_path']) if is_folder else os.path.isfile(doc['source_path']))):
+            raise NotFound('文件夹不可用' if is_folder else '文档不可用')
         if doc.get('ipath') and not allow_container:
             raise ValidationError('该容器内文档暂不支持继续阅读，请通过搜索结果预览或下载')
-        doc['content_version'] = self.version(doc['source_path'])
+        doc['content_version'] = '' if is_folder else self.version(doc['source_path'])
+        doc['folder_name'] = folder_name(doc['source_path'])
+        return doc
+
+    def folder(self, document_id, config=None):
+        doc = self.document(document_id, config, allow_folder=True)
+        if doc['format'] != 'folder':
+            raise NotFound('文件夹不可用')
         return doc
 
     def as_recoll_doc(self, document_id):
@@ -203,18 +299,28 @@ class ApplicationData:
             size=os.stat(path).st_size, fbytes=os.stat(path).st_size,
             mtime=int(os.stat(path).st_mtime), rcludi=doc.get('rcludi', ''))
 
-    def folder_key(self, root):
-        return hashlib.sha256((self.scope() + '\0' + os.path.realpath(root)).encode()).hexdigest()
+    def folder_key(self, root, config=None):
+        return folder_identity(self.scope(config), os.path.realpath(root))
 
-    def reader_metadata(self, item, doc=None, config=None, folder_key=None):
+    def folder_shelf_metadata(self, root, config=None):
+        ref = self.register_folder(root, config)
+        return {
+            'documentId': ref['id'], 'title': ref['title'], 'format': 'folder',
+            'openHandle': auth.sign_payload({'document_id': ref['id']}, 'shelf-add'),
+            'onShelf': self.store.is_on_shelf(auth.current_user()['id'], ref['id']),
+        }
+
+    def reader_metadata(self, item, doc=None, config=None, folder_key=None, shelf_document_id=None):
         ref = self.register_doc(doc, config) if doc is not None else self.register_path(
             item['path'], item.get('title', ''), item.get('format', ''), config)
         item['documentId'] = ref['id']
+        item['folder_name'] = folder_name(ref['source_path'])
         item['contentVersion'] = ref['content_version']
         settings = auth.current_settings()
         item['openHandle'] = auth.sign_payload({
             'document_id': ref['id'], 'reading_epoch': settings['reading_epoch'],
             'progress_epoch': settings['progress_epoch'], 'folder_key': folder_key,
+            'shelf_document_id': shelf_document_id or ref['id'],
         }, 'reader-open')
         item['onShelf'] = self.store.is_on_shelf(auth.current_user()['id'], ref['id'])
         return item
@@ -287,13 +393,13 @@ class ApplicationData:
         data = request_json()
         context = auth.read_payload(data.get('handle', ''), 'reader-open')
         if context:
-            document_id = context['document_id']
+            document_id = context.get('shelf_document_id') or context['document_id']
         else:
             context = auth.read_payload(data.get('handle', ''), 'shelf-add')
             if not context:
                 bottle.abort(403, '书籍上下文已失效，请刷新后重试')
             document_id = context['document_id']
-        doc = self.document(document_id, allow_container=True)
+        doc = self.document(document_id, allow_container=True, allow_folder=True)
         self.store.add_to_shelf(auth.current_user()['id'], doc['id'])
         return json_response({'onShelf': True})
 
@@ -352,6 +458,14 @@ class ApplicationData:
             return handler
 
         self.app.route('/search', method='POST', callback=endpoint(self.begin_search))
+        self.app.route('/recommendations/add', method='POST',
+                       callback=endpoint(lambda: self.change_recommendation(True)))
+        self.app.route('/recommendations/remove', method='POST',
+                       callback=endpoint(lambda: self.change_recommendation(False)))
+        self.app.route('/api/recommendations/add', method='POST',
+                       callback=endpoint(lambda: self.change_recommendation(True, api=True)))
+        self.app.route('/api/recommendations/remove', method='POST',
+                       callback=endpoint(lambda: self.change_recommendation(False, api=True)))
         self.app.route('/api/reader/open', method='POST', callback=endpoint(self.open_reading))
         self.app.route('/api/reader/progress/<document_id>', method='GET',
                        callback=endpoint(lambda document_id: json_response(self.progress_response(document_id))))

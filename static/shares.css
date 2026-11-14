@@ -1,0 +1,30 @@
+.share-create.account-narrow { max-width: 620px; }
+.share-target h2 { margin-top: 10px; }
+.share-target p:last-child { margin-bottom: 0; font-size: 14px; }
+.share-kind { display: inline-block; flex: none; white-space: nowrap; padding: 3px 8px; border-radius: 5px; background: #edf1e7; color: #52684d; font-size: 11px; font-weight: 650; }
+.share-help { font-size: 13px; margin: -6px 0 0 !important; }
+.share-list li.share-card { display: block; padding: 24px; }
+.share-card[data-created=true] { border-color: #87a17d; box-shadow: 0 0 0 3px #dbe7d270; }
+.share-card-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.share-card-heading > div { flex: 1; min-width: 0; }
+.share-card-heading h2 { margin: 8px 0; font-size: 19px; }
+.share-card > .account-muted { margin-bottom: 16px; font-size: 12px; }
+.share-status { flex: none; padding: 4px 9px; border-radius: 20px; background: #edf3e8; color: #315b46; font-size: 12px; }
+.share-status-expired { background: #f0ece7; color: #7f7266; }
+.share-link-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.share-link-label { flex-basis: 100%; font-size: 13px; color: var(--account-muted); }
+.share-url { min-width: 0; flex: 1 1 200px; min-height: 44px; padding: 10px 12px; border: 1px solid #cfd4c9; border-radius: 8px; background: #f8faf4; color: #3f5447; font: 13px/1.5 monospace; }
+.share-copy-status { min-height: 21px; font-size: 12px; margin: 7px 0 0 !important; }
+.share-card-actions { display: flex; justify-content: space-between; align-items: flex-start; gap: 18px; padding-top: 12px; margin-top: 10px; border-top: 1px solid var(--account-line); }
+.share-card-actions > form { margin: 0; }
+.share-expiry-edit { flex: 1; min-width: 0; }
+.share-expiry-edit .account-inline { max-width: 430px; margin: 4px 0 0; }
+.share-expiry-edit .account-inline label { min-width: min(180px, 100%); }
+@media (max-width: 600px) {
+  .shares-page .account-heading { flex-wrap: wrap; }
+  .share-list li.share-card { padding: 18px; }
+  .share-url { flex-basis: 100%; }
+  .share-link-row .account-button, .share-link-row button { flex: 1; }
+  .share-card-actions { flex-wrap: wrap; }
+  .share-expiry-edit { flex-basis: 100%; }
+}

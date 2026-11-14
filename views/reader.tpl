@@ -1,18 +1,20 @@
-%include("header", title=" Reader")
-<link rel="stylesheet" href="{{app_url('/static/reader/reader-ui.css')}}?v=reader-ui-1">
+%include("header", title=" Reader", shared=get('shared', False))
+<link rel="stylesheet" href="{{app_url('/static/reader/reader-ui.css')}}?v=reader-ui-4">
 <div id="reader-app" class="reader-shell" data-mode="{{mode}}" data-query="{{query_string}}" data-theme="sepia">
   <header class="reader-toolbar" id="reader-toolbar" aria-label="阅读工具栏">
     <div class="reader-toolbar-left">
-      <a class="reader-button reader-icon-button" href="{{results_url}}" title="返回搜索结果" aria-label="返回搜索结果"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 6-6 6 6 6M8 12h12"/></svg></a>
+      <a class="reader-button reader-icon-button" href="{{results_url}}" title="{{'分享内容' if get('shared', False) else '返回搜索结果'}}" aria-label="{{'分享内容' if get('shared', False) else '返回搜索结果'}}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 6-6 6 6 6M8 12h12"/></svg></a>
       <span class="reader-toolbar-divider" aria-hidden="true"></span>
-      <button class="reader-button reader-icon-button" id="reader-toggle-toc" type="button" title="目录、书单与搜索" aria-label="打开或收起阅读导航" aria-controls="reader-sidebar" aria-expanded="true"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16m4-11h4m-4 4h4"/></svg></button>
+      <button class="reader-button reader-icon-button" id="reader-toggle-toc" type="button" title="目录、书单与搜索（T）" aria-label="打开或收起阅读导航" aria-controls="reader-sidebar" aria-expanded="true" aria-keyshortcuts="T"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16m4-11h4m-4 4h4"/></svg></button>
     </div>
     <div class="reader-toolbar-center">
+      <div class="reader-meta reader-document-meta" id="reader-meta"></div>
       <div class="reader-title" id="reader-title">正在打开文档</div>
-      <div class="reader-meta" id="reader-meta"></div>
     </div>
     <div class="reader-toolbar-right">
-      <button class="reader-button reader-focus-button" id="reader-toggle-toolbar" type="button" title="专注阅读：收起工具栏" aria-label="收起阅读工具栏">收起顶栏</button>
+      <button class="reader-button reader-focus-button" id="reader-toggle-toolbar" type="button" title="专注阅读：收起工具栏（H）" aria-label="收起阅读工具栏" aria-keyshortcuts="H"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 16V5h16v11M8 21l4-4 4 4M4 10h16"/></svg><span>专注</span></button>
+      <button class="reader-button reader-icon-button reader-desktop-action" id="reader-fullscreen" data-reader-fullscreen type="button" title="全屏阅读（F）" aria-label="全屏阅读" aria-pressed="false" aria-keyshortcuts="F"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/></svg></button>
+      <button class="reader-button reader-icon-button reader-desktop-action" id="reader-help" data-reader-help type="button" title="阅读帮助与快捷键（?）" aria-label="阅读帮助与快捷键" aria-haspopup="dialog" aria-controls="reader-help-dialog" aria-keyshortcuts="Shift+/"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9.5 8.5a2.5 2.5 0 0 1 5 .5c0 1.5-2.5 2-2.5 4M12 16h.01"/></svg></button>
       <button class="reader-button reader-icon-button" id="reader-toggle-settings" type="button" title="阅读设置" aria-label="阅读设置" aria-controls="reader-settings-panel" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3"/><circle cx="15" cy="17" r="3"/></svg></button>
     </div>
   </header>
@@ -64,16 +66,20 @@
         <div id="page-area" class="reader-stage" tabindex="0" aria-label="文档内容，向下滚动继续阅读"><div class="reader-loading"><span class="reader-loading-mark" aria-hidden="true"></span>正在加载阅读器…</div></div>
       </div>
       <footer class="reader-progress-footer" aria-label="阅读进度">
-        <button class="reader-button reader-icon-button reader-page-step" id="reader-prev-page" type="button" title="上一页" aria-label="上一页"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 6-6 6 6 6"/></svg></button>
-        <label class="reader-sr-only" for="reader-progress-range">阅读进度</label>
-        <input id="reader-progress-range" class="reader-progress-range" type="range" min="0" max="1000" step="1" value="0" aria-label="阅读进度" disabled>
-        <output id="reader-progress-label" class="reader-progress-label" for="reader-progress-range">0%</output>
-        <button class="reader-button reader-icon-button reader-page-step" id="reader-next-page" type="button" title="下一页" aria-label="下一页"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m10 6 6 6-6 6"/></svg></button>
+        <button class="reader-button reader-icon-button reader-progress-step" id="reader-progress-prev-book" type="button" title="书单：上一册" aria-label="书单：上一册" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 10 6-6 6 6M12 4v16"/></svg></button>
+        <button class="reader-button reader-icon-button reader-progress-step" id="reader-prev-section" type="button" title="目录：上一文本区块" aria-label="目录：上一文本区块" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m10 6-6 6 6 6M4 12h16"/></svg></button>
+        <div class="reader-progress-track">
+          <label class="reader-sr-only" for="reader-progress-range">阅读进度</label>
+          <input id="reader-progress-range" class="reader-progress-range" type="range" min="0" max="1000" step="1" value="0" aria-label="阅读进度" disabled>
+          <output id="reader-progress-label" class="reader-progress-label" for="reader-progress-range">0%</output>
+        </div>
+        <button class="reader-button reader-icon-button reader-progress-step" id="reader-next-section" type="button" title="目录：下一文本区块" aria-label="目录：下一文本区块" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 6 6 6-6 6M4 12h16"/></svg></button>
+        <button class="reader-button reader-icon-button reader-progress-step" id="reader-progress-next-book" type="button" title="书单：下一册" aria-label="书单：下一册" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 14 6 6 6-6M12 4v16"/></svg></button>
       </footer>
     </main>
   </div>
   <button id="reader-settings-backdrop" class="reader-settings-backdrop" type="button" aria-label="关闭阅读设置" tabindex="-1" hidden></button>
-  <aside id="reader-settings-panel" class="reader-settings-panel" aria-labelledby="reader-settings-title" hidden>
+  <aside id="reader-settings-panel" class="reader-settings-panel" role="dialog" aria-modal="true" aria-labelledby="reader-settings-title" hidden>
     <div class="reader-panel-heading"><div><span class="reader-eyebrow">让阅读更舒适</span><h2 id="reader-settings-title">阅读设置</h2></div><button id="reader-close-settings" class="reader-button reader-icon-button" type="button" title="关闭设置" aria-label="关闭阅读设置"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6"/></svg></button></div>
     <div class="reader-settings-content">
       <div class="reader-setting"><label for="reader-theme">阅读主题</label><select id="reader-theme"><option value="light">明亮</option><option value="sepia" selected>暖纸</option><option value="dark">深色</option><option value="auto">跟随系统</option></select></div>
@@ -86,11 +92,33 @@
       <div data-reader-text-setting class="reader-setting reader-setting-check"><label for="reader-indent"><span>首行缩进</span><small>每段开头空两个字</small></label><input id="reader-indent" type="checkbox" role="switch"></div>
       <div data-reader-text-setting class="reader-setting reader-setting-check"><label for="reader-preserve-publisher"><span>保留原书排版</span><small>优先使用文档自带的文字样式</small></label><input id="reader-preserve-publisher" type="checkbox" role="switch"></div>
       <p class="reader-setting-note">排版设置适用于文字文档。PDF 保留原版式，可单独缩放。</p>
+      <div class="reader-settings-actions" aria-label="阅读工具">
+        <button class="reader-button" data-reader-fullscreen type="button" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/></svg><span data-fullscreen-label>全屏阅读</span></button>
+        <button class="reader-button" data-reader-help type="button" aria-haspopup="dialog" aria-controls="reader-help-dialog"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9.5 8.5a2.5 2.5 0 0 1 5 .5c0 1.5-2.5 2-2.5 4M12 16h.01"/></svg>阅读帮助与快捷键</button>
+      </div>
+      <p id="reader-experience-status" class="reader-setting-note" role="status" aria-live="polite"></p>
       <label class="reader-txt-rule-hidden" for="reader-parser-regex" hidden>TXT 章节规则</label>
       <input class="reader-input reader-txt-rule-hidden" id="reader-parser-regex" placeholder="可选" hidden>
       <button class="reader-button reader-txt-rule-hidden" id="reader-save-regex" type="button" hidden>保存</button>
     </div>
   </aside>
+  <dialog id="reader-help-dialog" class="reader-dialog reader-help-dialog" aria-labelledby="reader-help-title">
+    <div class="reader-panel-heading"><div><span class="reader-eyebrow">自在阅读，随手掌控</span><h2 id="reader-help-title">阅读帮助与快捷键</h2></div><button id="reader-close-help" class="reader-button reader-icon-button" type="button" aria-label="关闭阅读帮助" autofocus><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6"/></svg></button></div>
+    <div class="reader-help-content">
+      <p>打开左侧导航，可切换目录、书单与书内搜索。搜索跳转后，点击「返回阅读处」即可回到原来的位置。</p>
+      <dl class="reader-shortcuts">
+        <div><dt>书内搜索</dt><dd><kbd>Ctrl</kbd> / <kbd>⌘</kbd> + <kbd>F</kbd> 或 <kbd>/</kbd></dd></div>
+        <div><dt>打开 / 收起导航</dt><dd><kbd>T</kbd></dd></div>
+        <div><dt>显示 / 收起工具栏</dt><dd><kbd>H</kbd></dd></div>
+        <div><dt>进入 / 退出全屏</dt><dd><kbd>F</kbd></dd></div>
+        <div><dt>向后阅读</dt><dd><kbd>Page Down</kbd> / <kbd>空格</kbd></dd></div>
+        <div><dt>向前阅读</dt><dd><kbd>Page Up</kbd></dd></div>
+        <div><dt>关闭弹层</dt><dd><kbd>Esc</kbd></dd></div>
+        <div><dt>显示阅读帮助</dt><dd><kbd>?</kbd></dd></div>
+      </dl>
+      <p class="reader-help-note">在正文区域使用快捷键；输入文字、调整设置时不会触发。手机上可从阅读设置打开全屏与帮助。点击正文图片可放大，点击脚注可查看注释。</p>
+    </div>
+  </dialog>
   <dialog id="reader-image-dialog" class="reader-dialog reader-image-dialog" aria-label="查看文档图片">
     <button id="reader-close-image" class="reader-button reader-icon-button reader-dialog-close" type="button" aria-label="关闭图片" autofocus><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6"/></svg></button>
     <div class="reader-image-viewport"><img id="reader-image-preview" alt="文档图片"></div>
@@ -103,5 +131,5 @@
 <script>
 window.RECOLL_READER = {{!reader_config_json}};
 </script>
-<script type="module" src="{{app_url('/static/reader/app.js')}}?v=reader-ui-1"></script>
+<script type="module" src="{{app_url('/static/reader/app.js')}}?v=reader-ui-5"></script>
 %include("footer")

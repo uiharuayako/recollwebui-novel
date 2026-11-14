@@ -163,3 +163,102 @@ test('a delayed return cannot clear a newer temporary jump and reset cancels lat
   assert.equal(navigation.activeIndex, -1);
   assert.equal(navigation.canReturn, false);
 });
+
+test('adjacent navigation follows directory entries within one TXT chunk and stops at either end', async () => {
+  const calls = [], states = [];
+  const context = { format: 'txt', txt: { manifest: { chunks: [{}, {}], toc: [
+    { index: 0, label: '第一章', textOffset: 0 },
+    { index: 0, label: '第二章', textOffset: 120 },
+    { index: 1, label: '第三章', textOffset: 20 },
+  ] } } };
+  const navigation = new ReaderNavigation({ document: null, getContext: () => context,
+    onNavigate: (target) => calls.push(target.label), onState: (state) => states.push(state.activeOutlineIndex) });
+  await navigation.refresh(); navigation.setActive(0);
+  await navigation.navigateAdjacent(-1);
+  await navigation.navigateAdjacent(1);
+  await navigation.navigateAdjacent(1);
+  await navigation.navigateAdjacent(1);
+  await navigation.navigateAdjacent(-1);
+  await navigation.navigateAdjacent(-1);
+  await navigation.navigateAdjacent(-1);
+  assert.deepEqual(calls, ['第二章', '第三章', '第二章', '第一章']);
+  assert.equal(navigation.activeOutlineIndex, 0);
+  assert.ok(states.includes(2));
+  navigation.reset();
+  assert.equal(navigation.activeOutlineIndex, -1);
+  await navigation.navigateAdjacent(1);
+  assert.equal(calls.length, 4);
+});
+
+test('adjacent EPUB navigation preserves fragment entries in the same source document', async () => {
+  const calls = [];
+  const context = { format: 'epub', epub: { chapters: [{ href: 'book.xhtml' }], toc: [
+    { href: 'book.xhtml#one', label: 'One' }, { href: 'book.xhtml#two', label: 'Two' },
+  ] } };
+  const navigation = new ReaderNavigation({ document: null, getContext: () => context,
+    onNavigate: (target) => calls.push(target.fragment) });
+  await navigation.refresh();
+  await navigation.navigateAdjacent(1);
+  await navigation.navigateAdjacent(1);
+  await navigation.navigateAdjacent(1);
+  assert.deepEqual(calls, ['one', 'two']);
+  await navigation.navigateAdjacent(-1);
+  assert.deepEqual(calls, ['one', 'two', 'one']);
+});
+
+test('PDF adjacent navigation starts from the directory section containing the restored page', async () => {
+  const calls = [];
+  const context = { format: 'pdf', position: { pageNumber: 5 }, rendition: {
+    getOutline: async () => [{ label: 'One', pageNumber: 1 }, { label: 'Two', pageNumber: 3 }, { label: 'Three', pageNumber: 8 }],
+  } };
+  const navigation = new ReaderNavigation({ document: null, getContext: () => context,
+    onNavigate: (target) => { calls.push(target.pageNumber); context.position = { pageNumber: target.pageNumber }; } });
+  await navigation.refresh();
+  assert.equal(navigation.activeOutlineIndex, 1);
+  await navigation.navigateAdjacent(1);
+  await navigation.navigateAdjacent(1);
+  await navigation.navigateAdjacent(-1);
+  assert.deepEqual(calls, [8, 3]);
+});
+
+test('CHM adjacent navigation resolves the current href instead of a document index', async () => {
+  const calls = [];
+  const context = { format: 'chm', position: { href: 'two.htm' }, chm: { toc: [
+    { href: 'one.htm', label: 'One' }, { href: 'two.htm', label: 'Two' }, { href: 'three.htm', label: 'Three' },
+  ] } };
+  const navigation = new ReaderNavigation({ document: null, getContext: () => context,
+    onNavigate: (target) => { calls.push(target.href); context.position = { href: target.href }; } });
+  await navigation.refresh();
+  assert.equal(navigation.activeOutlineIndex, 1);
+  await navigation.navigateAdjacent(1);
+  await navigation.navigateAdjacent(-1);
+  assert.deepEqual(calls, ['three.htm', 'two.htm']);
+  context.position.href = 'one.htm#paragraph'; navigation.updateActiveHeading();
+  assert.equal(navigation.activeOutlineIndex, 0);
+});
+
+test('CHM directory entries expose decoded fragments to the shared text navigation', async () => {
+  const navigation = new ReaderNavigation({ document: null, getContext: () => ({ format: 'chm', chm: { toc: [
+    { href: 'chapter.htm#%E7%AB%A0%E8%8A%82', label: '章节' },
+  ] } }) });
+  const outline = await navigation.refresh();
+  assert.equal(outline[0].fragment, '章节');
+});
+
+test('PDF adjacent navigation visits multiple directory destinations on the same page', async () => {
+  const calls = [];
+  const context = { format: 'pdf', position: { pageNumber: 1 }, rendition: {
+    getOutline: async () => [1, 2, 3].map((number) => ({ label: `Section ${number}`, pageNumber: 1,
+      dest: [0, { name: 'XYZ' }, 0, number * 100, null] })),
+  } };
+  const navigation = new ReaderNavigation({ document: null, getContext: () => context,
+    onNavigate: (target) => calls.push(target.label) });
+  await navigation.refresh();
+  await navigation.navigate(navigation.outline[0]);
+  await navigation.navigateAdjacent(1);
+  await navigation.navigateAdjacent(1);
+  await navigation.navigateAdjacent(-1);
+  assert.deepEqual(calls, ['Section 1', 'Section 2', 'Section 3', 'Section 2']);
+  context.position.pageNumber = 2; navigation.updateActiveHeading();
+  assert.equal(navigation.activeOutlineIndex, 2);
+});

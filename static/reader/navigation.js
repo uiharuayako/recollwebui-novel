@@ -138,9 +138,9 @@ export class ReaderNavigation {
     this.onKeep = onKeep || (() => {}); this.onState = onState || (() => {});
     this.document = uiDocument; this.fetch = fetchImpl;
     this.parseDocument = parseDocument || ((text) => new DOMParser().parseFromString(text, 'text/html'));
-    this.outline = []; this.results = []; this.activeIndex = -1; this.canReturn = false;
+    this.outline = []; this.results = []; this.activeIndex = -1; this.activeOutlineIndex = -1; this.canReturn = false;
     this.generation = 0; this.searchGeneration = 0; this.outlineGeneration = 0; this.navigationGeneration = 0; this.textCache = new Map(); this.tab = 'toc';
-    this.requests = new Set(); this.stopped = false;
+    this.requests = new Set(); this.stopped = false; this.navigationPosition = null;
     this.attach();
   }
   el(id) { return this.document?.getElementById(id); }
@@ -179,7 +179,8 @@ export class ReaderNavigation {
     for (const id of ['reader-return-position', 'reader-keep-position', 'reader-return-banner']) {
       const element = this.el(id); if (element) element.hidden = !this.canReturn;
     }
-    this.onState({ outline: this.outline, results: this.results, activeIndex: this.activeIndex, canReturn: this.canReturn, ...extra });
+    this.onState({ outline: this.outline, results: this.results, activeIndex: this.activeIndex,
+      activeOutlineIndex: this.activeOutlineIndex, canReturn: this.canReturn, ...extra });
   }
   status(message) { const node = this.el('reader-search-status'); if (node) node.textContent = message; }
   context() { const context = this.getContext() || {}; return { ...context, format: string(context.format || context.current?.format).toLowerCase() }; }
@@ -189,7 +190,8 @@ export class ReaderNavigation {
     this.generation += 1; this.searchGeneration += 1; this.outlineGeneration += 1; this.navigationGeneration += 1;
     for (const controller of this.requests) controller.abort();
     this.requests.clear(); this.clearHighlights(); this.textCache.clear();
-    this.outline = []; this.results = []; this.activeIndex = -1; this.canReturn = false;
+    this.outline = []; this.results = []; this.activeIndex = -1; this.activeOutlineIndex = -1; this.canReturn = false;
+    this.navigationPosition = null;
     if (this.boundStage && this.scrollListener) this.boundStage.removeEventListener('scroll', this.scrollListener);
     this.boundStage = null; this.scrollListener = null;
     this.el('reader-toc-list')?.replaceChildren(); this.el('reader-search-results')?.replaceChildren();
@@ -202,7 +204,8 @@ export class ReaderNavigation {
     for (const controller of this.requests) controller.abort();
     this.requests.clear();
     const token = ++this.generation;
-    this.searchGeneration += 1; this.outlineGeneration += 1; this.textCache.clear(); this.results = []; this.outline = []; this.canReturn = false;
+    this.searchGeneration += 1; this.outlineGeneration += 1; this.textCache.clear(); this.results = []; this.outline = [];
+    this.activeOutlineIndex = -1; this.canReturn = false; this.navigationPosition = null;
     this.renderResults(); this.status(''); this.emit();
     const context = this.context();
     try {
@@ -215,7 +218,8 @@ export class ReaderNavigation {
         }
         if (token !== this.generation) return [];
         this.outline = outline.map((item) => ({ ...item, kind: 'pdf', index: Math.max(0, Number(item.pageNumber || 1) - 1) }));
-      } else if (context.format === 'chm') this.outline = (context.chm?.toc || []).map((item, index) => ({ ...item, kind: 'chm', index }));
+      } else if (context.format === 'chm') this.outline = (context.chm?.toc || []).map((item, index) => ({ ...item, kind: 'chm', index,
+        fragment: item.fragment || decode(string(item.href).split('#').slice(1).join('#')) }));
       else if (context.format === 'txt') {
         const chunks = context.txt?.manifest?.chunks || [];
         const manifestToc = context.txt?.manifest?.toc;
@@ -352,11 +356,23 @@ export class ReaderNavigation {
     try {
       await this.onNavigate(target, { temporary });
       if (token !== this.navigationGeneration || this.stopped) return;
-      this.setActive(target.index); this.emit();
+      this.setActive(target.index);
+      const ordinal = this.outline.indexOf(target);
+      if (ordinal >= 0) {
+        this.setActiveOutline(ordinal);
+        this.navigationPosition = { target, key: this.readingPositionKey(this.context()) };
+      }
+      this.emit();
     } catch (error) {
       if (token !== this.navigationGeneration || this.stopped) return;
       this.canReturn = previous; this.status(`跳转失败：${error.message}`); this.emit({ error: error.message });
     }
+  }
+  async navigateAdjacent(direction) {
+    if (this.stopped || !this.outline.length) return;
+    this.updateActiveHeading();
+    const ordinal = this.activeOutlineIndex + direction;
+    if (ordinal >= 0 && ordinal < this.outline.length) await this.navigate(this.outline[ordinal]);
   }
   async returnToReading() {
     if (this.stopped) return;
@@ -384,35 +400,92 @@ export class ReaderNavigation {
     }
     return [...unique.values()];
   }
+  readingPositionKey(context) {
+    const position = context.position || {};
+    return JSON.stringify([context.stage?.scrollTop, position.chunkIndex, position.chapterDocIndex,
+      position.pageNumber, position.pageOffsetRatio, position.href, position.scrollTop, position.scrollLeft]);
+  }
   updateActiveHeading() {
-    const context = this.context(); if (!context.stage) return;
-    const viewportTop = context.stage.getBoundingClientRect().top + 80;
+    const context = this.context(), position = context.position || {}, documents = this.documents(context);
+    // A target near the document end may be unable to reach the viewport top.
+    // Keep the chosen entry until the actual reading position changes.
+    if (this.navigationPosition?.key === this.readingPositionKey(context)) {
+      const ordinal = this.outline.indexOf(this.navigationPosition.target);
+      if (ordinal >= 0) { this.setActiveOutline(ordinal); return; }
+    }
+    this.navigationPosition = null;
+    const viewportTop = context.stage ? context.stage.getBoundingClientRect().top + 80 : null;
+    let index = context.format === 'txt' ? Number(position.chunkIndex) : context.format === 'pdf'
+      ? Number(position.pageNumber) - 1 : Number(position.chapterDocIndex);
+    if (!Number.isFinite(index)) index = this.activeIndex;
+    if (viewportTop != null && context.format !== 'chm') {
+      for (const entry of documents) {
+        if (entry.frame?.getBoundingClientRect().top <= viewportTop) index = entry.index;
+      }
+    }
     let selected = -1;
-    this.outline.forEach((item, ordinal) => {
-      if (!item.element?.isConnected) return;
-      const frame = this.documents(context).find((entry) => entry.index === item.index)?.frame;
-      const top = item.element.getBoundingClientRect().top + (frame?.getBoundingClientRect().top || 0);
-      if (top <= viewportTop) selected = ordinal;
+    if (context.format === 'chm') {
+      const href = decode(string(position.href)).replace(/^\.\//, '');
+      selected = this.outline.findIndex((item) => decode(string(item.href)).replace(/^\.\//, '') === href);
+      if (selected < 0) selected = this.outline.findIndex((item) => hrefPath(item.href) === hrefPath(href));
+    } else {
+      for (let ordinal = 0; ordinal < this.outline.length; ordinal += 1) {
+        const item = this.outline[ordinal];
+        if (item.index < index || (context.format === 'pdf' && item.index === index)) selected = ordinal;
+      }
+      const current = this.outline.findIndex((item) => item.index === index);
+      if (context.format !== 'pdf' && current >= 0) {
+        selected = this.outline[this.activeOutlineIndex]?.index === index ? this.activeOutlineIndex : current;
+      }
+    }
+    // A source file can contain several directory entries. Resolve their actual
+    // positions in mounted documents rather than treating its index as a TOC index.
+    const indexes = new Map();
+    let measured = false, before = -1;
+    if (viewportTop != null && context.format !== 'pdf') this.outline.forEach((item, ordinal) => {
+      const entry = context.format === 'chm' ? (hrefPath(item.href) === hrefPath(position.href) ? documents[0] : null)
+        : documents.find((candidate) => candidate.index === item.index);
+      const doc = entry?.document; if (!doc?.body || !entry.frame) return;
+      let node = item.element?.isConnected ? item.element : null;
+      const fragment = item.fragment || (context.format === 'chm' ? string(item.href).split('#')[1] : '');
+      if (!node && fragment) node = doc.getElementById(decode(fragment)) || doc.getElementsByName(decode(fragment))[0];
+      let rect = node?.getBoundingClientRect();
+      if (!rect) {
+        if (item.textOffset == null && !item.query) return;
+        if (!indexes.has(doc)) indexes.set(doc, buildTextIndex(doc));
+        const offset = Number(item.textOffset) || 0;
+        const segment = indexes.get(doc).segments.find((part) => part.end > offset);
+        if (!segment) return;
+        const range = doc.createRange(), start = Math.max(0, offset - segment.start);
+        range.setStart(segment.node, start); range.setEnd(segment.node, Math.min(segment.node.length, start + 1));
+        rect = range.getBoundingClientRect();
+      }
+      const top = rect.top + entry.frame.getBoundingClientRect().top;
+      measured = true;
+      if (top <= viewportTop) before = ordinal;
     });
-    if (selected < 0) return;
-    this.el('reader-toc-list')?.querySelectorAll('[data-section-index]').forEach((node, ordinal) => {
-      const active = ordinal === selected; node.classList.toggle('is-active', active);
-      if (active) node.setAttribute('aria-current', 'location'); else node.removeAttribute('aria-current');
-    });
+    if (measured) {
+      if (before >= 0) selected = before;
+      else selected = this.outline.findLastIndex((item) => item.index < index);
+    }
+    this.setActiveOutline(selected);
   }
   setActive(index) {
     this.activeIndex = Number(index);
-    let matched = false;
-    this.el('reader-toc-list')?.querySelectorAll('[data-section-index]').forEach((node) => {
-      const active = !matched && Number(node.dataset.sectionIndex) === this.activeIndex;
-      if (active) matched = true;
+    this.updateActiveHeading();
+  }
+  setActiveOutline(ordinal) {
+    const changed = ordinal !== this.activeOutlineIndex;
+    this.activeOutlineIndex = ordinal;
+    this.el('reader-toc-list')?.querySelectorAll('[data-section-index]').forEach((node, index) => {
+      const active = index === ordinal;
       node.classList.toggle('is-active', active);
       if (active) node.setAttribute('aria-current', 'location'); else node.removeAttribute('aria-current');
     });
-    this.updateActiveHeading();
+    if (changed) this.emit();
   }
   renderOutline(emptyMessage = '当前文档没有章节标题') {
-    const parent = this.el('reader-toc-list'); if (!parent) return;
+    const parent = this.el('reader-toc-list'); if (!parent) { this.updateActiveHeading(); return; }
     parent.replaceChildren();
     for (const item of this.outline) {
       const button = this.document.createElement('button'); button.type = 'button'; button.className = 'reader-book-item reader-toc-item';

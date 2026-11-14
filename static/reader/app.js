@@ -2,6 +2,8 @@ import { ReaderAccountSync, sectionReadingProgress } from './account-sync.js';
 import { ReaderSettings } from './settings.js';
 import { captureTextAnchor, restoreTextAnchor } from './anchors.js';
 import { ReaderNavigation, scrollToTextMatch } from './navigation.js';
+import { ReaderExperience } from './experience.js';
+import { ChmSandboxReader } from './chm-adapter.js';
 
 const query = new URLSearchParams(window.location.search);
 document.documentElement.classList.add('reader-page-root');
@@ -44,6 +46,7 @@ const state = {
   currentChmManifest: null,
   currentChmHref: '',
   currentChmRestore: null,
+  chmSandbox: null,
   folderMeta: null,
   bookMeta: null,
   currentBlobUrl: '',
@@ -117,6 +120,7 @@ const state = {
 
 let readerSettings;
 let readerNavigation;
+let readerExperience;
 
 window.Kookit = window.Kookit || {};
 const ensureKookitRuntime = async () => {
@@ -154,8 +158,6 @@ const fontSizeLabel = el('reader-font-size');
 const fontDecreaseButton = el('reader-font-decrease');
 const fontIncreaseButton = el('reader-font-increase');
 const parserInput = el('reader-parser-regex');
-const prevPageButton = el('reader-prev-page');
-const nextPageButton = el('reader-next-page');
 const sidebarHeader = sidebar ? sidebar.querySelector('.reader-sidebar-header') : null;
 parserInput.value = state.parserRegex;
 
@@ -164,6 +166,7 @@ syncStatus.className = 'reader-meta';
 syncStatus.setAttribute('role', 'status');
 syncStatus.setAttribute('aria-live', 'polite');
 const syncMessage = document.createElement('span');
+if (readerConfig.shared) syncMessage.textContent = '分享阅读 · 无需登录';
 syncStatus.appendChild(syncMessage);
 const adoptSavedButton = document.createElement('button');
 adoptSavedButton.type = 'button';
@@ -184,13 +187,30 @@ const showReaderError = (message) => {
 const shelfButton = document.createElement('button');
 shelfButton.type = 'button';
 shelfButton.className = 'reader-button reader-shelf-button';
-shelfButton.textContent = '加入书架';
+shelfButton.textContent = mode === 'folder' ? '加入文件夹' : '加入书架';
 shelfButton.disabled = true;
-toolbar.querySelector('.reader-toolbar-right')?.prepend(shelfButton);
+const shareButton = document.createElement('a');
+shareButton.className = 'reader-button reader-share-button';
+shareButton.textContent = mode === 'folder' ? '分享文件夹' : '分享此书';
+shareButton.title = shareButton.textContent;
+shareButton.setAttribute('aria-label', shareButton.textContent);
+shareButton.hidden = true;
+if (account && !readerConfig.shared) toolbar.querySelector('.reader-toolbar-right')?.prepend(shelfButton, shareButton);
+const pendingShelfUpdates = new Set();
+const getShelfTarget = () => mode === 'folder' ? state.folderMeta?.shelf : state.current;
 const updateShelfButton = () => {
-  shelfButton.textContent = state.current?.onShelf ? '移出书架' : '加入书架';
-  shelfButton.title = shelfButton.textContent; shelfButton.setAttribute('aria-label', shelfButton.textContent);
-  shelfButton.disabled = !state.current?.openHandle || !account || accountSync.stopped;
+  const target = getShelfTarget();
+  const isFolder = mode === 'folder';
+  shelfButton.textContent = isFolder
+    ? (target?.onShelf ? '移出文件夹' : '加入文件夹')
+    : (target?.onShelf ? '移出书架' : '加入书架');
+  shelfButton.title = isFolder ? (target?.onShelf ? '从书架移出此文件夹' : '将此文件夹加入书架') : shelfButton.textContent;
+  shelfButton.setAttribute('aria-label', shelfButton.title);
+  shelfButton.disabled = !target?.documentId || !target?.openHandle || !account || accountSync.stopped
+    || pendingShelfUpdates.has(target.documentId);
+  shareButton.hidden = !account || !!readerConfig.shared || !target?.documentId || accountSync.stopped;
+  if (!shareButton.hidden) shareButton.href = `${applicationBase}/shares/new?document_id=${encodeURIComponent(target.documentId)}`;
+  else shareButton.removeAttribute('href');
 };
 
 const clearAccountReader = (message = '登录状态已改变，请重新登录后打开文档。') => {
@@ -217,6 +237,9 @@ const clearAccountReader = (message = '登录状态已改变，请重新登录�
   syncMessage.textContent = message;
   adoptSavedButton.hidden = continueHereButton.hidden = true;
   shelfButton.disabled = true;
+  shareButton.hidden = true;
+  shareButton.removeAttribute('href');
+  updateNavigationControls();
   setError(message);
 };
 
@@ -243,20 +266,34 @@ continueHereButton.addEventListener('click', async () => {
   await accountSync.resolve(true);
 });
 shelfButton.addEventListener('click', async () => {
-  const item = state.current;
+  const item = getShelfTarget();
   if (!item || shelfButton.disabled) return;
-  shelfButton.disabled = true;
+  pendingShelfUpdates.add(item.documentId);
+  updateShelfButton();
+  const onShelf = !!item.onShelf;
   try {
-    const onShelf = !!item.onShelf;
     const data = await accountSync.request(`${applicationBase}/api/bookshelf/${onShelf ? 'remove' : 'add'}`, {
       body: onShelf ? { document_id: item.documentId } : { handle: item.openHandle },
     });
     item.onShelf = !!data.onShelf;
-    syncMessage.textContent = item.onShelf ? '已加入书架' : '已移出书架';
+    if (getShelfTarget() === item) {
+      const subject = mode === 'folder' ? '文件夹' : '';
+      syncMessage.textContent = item.onShelf ? `${subject}已加入书架` : `${subject}已移出书架`;
+    }
     window.RecollAccount?.broadcast?.('bookshelf-changed');
   } catch (error) {
-    showReaderError(`书架未更新：${error.message}`);
-  } finally { updateShelfButton(); }
+    if (onShelf && error.status === 404) {
+      // Another tab may already have removed this entry from the bookshelf.
+      item.onShelf = false;
+      if (getShelfTarget() === item) syncMessage.textContent = mode === 'folder' ? '文件夹已移出书架' : '已移出书架';
+      window.RecollAccount?.broadcast?.('bookshelf-changed');
+    } else if (getShelfTarget() === item) {
+      showReaderError(`书架未更新：${error.message}`);
+    }
+  } finally {
+    pendingShelfUpdates.delete(item.documentId);
+    updateShelfButton();
+  }
 });
 
 const safeText = (value) => (value == null ? '' : String(value));
@@ -1155,6 +1192,7 @@ const closeSidebar = () => {
   sidebar.classList.add('is-hidden');
   el('reader-toggle-toc')?.setAttribute('aria-expanded', 'false');
   document.body.classList.remove('reader-sidebar-open');
+  readerExperience?.syncPanels();
 };
 
 const openSidebar = () => {
@@ -1163,6 +1201,7 @@ const openSidebar = () => {
   if (isMobileViewport()) {
     document.body.classList.add('reader-sidebar-open');
   }
+  readerExperience?.syncPanels();
 };
 
 const syncSidebarState = () => {
@@ -1795,6 +1834,7 @@ const syncPagedStageViewport = () => {
 };
 
 const getChmCurrentPosition = () => {
+  if (state.chmSandbox) return state.chmSandbox.getPosition();
   const iframe = getActiveContentFrame();
   if (!iframe?.dataset.readerContentLoaded || !state.currentChmManifest) return null;
   try {
@@ -1834,10 +1874,14 @@ const saveFolderCursor = (meta) => {
   meta.currentIndex = state.currentIndex;
 };
 
-const updateMeta = () => {
+const documentMetaMarkup = (item) => `
+  <span class="reader-format-tag">${escapeHtml(item.format ? item.format.toUpperCase() : '文档')}</span>
+  ${item.folder_name ? `<span class="reader-folder-name" title="${escapeHtml(item.folder_name)}">${escapeHtml(item.folder_name)}</span>` : ''}`;
+
+const updateMeta = (includeName = true) => {
   if (!state.current) return;
-  const parts = [state.current.format ? state.current.format.toUpperCase() : '', state.current.author || '', state.current.name || ''].filter(Boolean);
-  metaEl.textContent = parts.join(' · ');
+  const parts = [state.current.author || '', includeName ? state.current.name || '' : ''].filter(Boolean);
+  metaEl.innerHTML = documentMetaMarkup(state.current) + (parts.length ? `<span class="reader-document-info">${escapeHtml(parts.join(' · '))}</span>` : '');
   titleEl.textContent = state.current.title || state.current.name || 'Reader';
 };
 
@@ -1852,8 +1896,9 @@ const renderSidebar = () => {
   }
   const libraryMarkup = state.items.map((item, idx) => `
     <button class="reader-book-item ${idx === state.currentIndex ? 'is-active' : ''}" data-index="${idx}">
+      <span class="reader-document-meta">${documentMetaMarkup(item)}</span>
       ${escapeHtml(item.title || item.name || 'Untitled')}
-      <small>${escapeHtml(item.format || '')} ${item.path ? escapeHtml(item.path.replace(item.root || '', '')) : ''}</small>
+      ${item.path ? `<small>${escapeHtml(item.path.replace(item.root || '', ''))}</small>` : ''}
     </button>`).join('');
   booklist.innerHTML = libraryMarkup;
   booklist.querySelectorAll('[data-index]').forEach((btn) => {
@@ -1887,6 +1932,8 @@ const cleanupRendition = () => {
   window.clearTimeout(state.genericRecordTimer);
   window.clearTimeout(state.epubWindow.syncTimer);
   window.clearTimeout(state.txtWindow.syncTimer);
+  state.chmSandbox?.destroy();
+  state.chmSandbox = null;
   state.currentChmManifest = null;
   state.currentChmHref = '';
   state.currentChmRestore = null;
@@ -1902,16 +1949,20 @@ const cleanupRendition = () => {
   }
 };
 
-const updatePageButtons = () => {
-  const showPageButtons = isPagedReaderMode(state.readerMode);
+const updateNavigationControls = ({ outline = readerNavigation?.outline || [],
+  activeOutlineIndex = readerNavigation?.activeOutlineIndex ?? -1 } = {}) => {
   syncReaderModeUi();
-  const canPage = !isChmFormat(state.current && state.current.format)
-    && !isTxtFormat(state.current && state.current.format)
-    && !!(state.rendition && typeof state.rendition.prev === 'function' && typeof state.rendition.next === 'function');
-  prevPageButton.hidden = !showPageButtons;
-  nextPageButton.hidden = !showPageButtons;
-  prevPageButton.disabled = !showPageButtons || !canPage;
-  nextPageButton.disabled = !showPageButtons || !canPage;
+  const ready = !!state.current && !state.isOpening && !accountSync.stopped;
+  for (const id of ['reader-prev-book', 'reader-progress-prev-book']) {
+    const button = el(id); if (button) button.disabled = !ready || state.currentIndex <= 0;
+  }
+  for (const id of ['reader-next-book', 'reader-progress-next-book']) {
+    const button = el(id); if (button) button.disabled = !ready || state.currentIndex >= state.items.length - 1;
+  }
+  const canNavigate = ready && !!(state.rendition || state.currentChmManifest)
+    && !readerNavigation?.stopped && outline.length > 0;
+  if (el('reader-prev-section')) el('reader-prev-section').disabled = !canNavigate || activeOutlineIndex <= 0;
+  if (el('reader-next-section')) el('reader-next-section').disabled = !canNavigate || activeOutlineIndex >= outline.length - 1;
 };
 
 const turnPage = async (direction) => {
@@ -1930,6 +1981,7 @@ const turnPage = async (direction) => {
 const scrollReadingViewport = (direction) => {
   if (isPagedReaderMode(state.readerMode) || !stage) return;
   const amount = Math.max(120, stage.clientHeight - 72) * direction;
+  if (state.chmSandbox) { state.chmSandbox.scrollBy(amount); return; }
   if (state.current && isChmFormat(state.current.format)) {
     const iframe = getActiveContentFrame();
     try {
@@ -1954,10 +2006,12 @@ const scrollReadingViewport = (direction) => {
 };
 
 const shouldHandleStageKey = (event) => {
+  if (event.defaultPrevented || event.isComposing || event.ctrlKey || event.metaKey || event.altKey
+      || document.querySelector('dialog[open]') || el('reader-settings-panel')?.hidden === false
+      || (isMobileViewport() && !sidebar.classList.contains('is-hidden'))) return false;
   const target = event.target;
   if (!target) return true;
-  const tagName = target.tagName ? target.tagName.toLowerCase() : '';
-  return !/^(input|textarea|select|button)$/.test(tagName);
+  return !target.closest?.('input,textarea,select,button,a[href],[contenteditable]:not([contenteditable="false"]),[role="textbox"],[role="slider"]');
 };
 
 const isInteractiveTouchTarget = (target) => {
@@ -2060,6 +2114,7 @@ const bindStageNavigation = () => {
 };
 
 const bindIframeNavigation = () => {
+  if (state.chmSandbox) return;
   const iframe = getActiveContentFrame();
   if (!iframe || iframe.dataset.readerBound === 'yes') return;
   const handleKeydown = (event) => {
@@ -2091,8 +2146,9 @@ const bindIframeNavigation = () => {
 const fetchReaderResponse = async (url, options = {}) => {
   const res = await fetch(url, { ...options, credentials: 'same-origin' });
   if (res.status === 401) {
-    clearAccountReader();
-    throw new Error('登录已失效，请重新登录');
+    const message = readerConfig.shared ? '分享已失效，请联系分享者。' : '登录已失效，请重新登录';
+    clearAccountReader(message);
+    throw new Error(message);
   }
   if (!res.ok) {
     throw new Error(`读取文档失败 (${res.status})`);
@@ -2135,10 +2191,9 @@ const findChmTocEntry = (href) => {
 
 const updateChmMeta = () => {
   if (!state.current || !state.currentChmManifest) return;
-  const parts = [state.current.format ? state.current.format.toUpperCase() : '', state.current.author || ''].filter(Boolean);
   const currentEntry = findChmTocEntry(state.currentChmHref);
   const label = currentEntry && currentEntry.label ? currentEntry.label : (state.current.title || state.current.name || 'Reader');
-  metaEl.textContent = parts.join(' · ');
+  updateMeta(false);
   titleEl.textContent = label;
 };
 
@@ -2156,10 +2211,15 @@ const openChmHref = async (href, restore = null) => {
   state.currentChmRestore = restore && typeof restore === 'object' ? restore : null;
   updateChmMeta();
   renderSidebar();
+  if (state.chmSandbox) {
+    await state.chmSandbox.open(state.currentChmHref, restore);
+    return;
+  }
   iframe.src = url;
 };
 
 const handleChmFrameLoad = (iframe) => {
+  if (state.chmSandbox) { state.chmSandbox.setStyle(buildReaderStyle()); return; }
   if (!iframe || !state.currentChmManifest) return;
   let doc;
   let win;
@@ -2204,6 +2264,9 @@ const handleChmFrameLoad = (iframe) => {
     const value = element.getAttribute(attr);
     if (!value || /^(https?:|javascript:|data:|mailto:|file:|#|tel:)/i.test(value)) return;
     if (/^\/[^/]/.test(value)) {
+      const base = new URL(contentBaseUrl, window.location.origin);
+      const target = new URL(value, window.location.origin);
+      if (target.origin === base.origin && target.pathname.startsWith(base.pathname)) return;
       const rel = value.replace(/^\/+/, '');
       element.setAttribute(attr, resolveChmContentUrl(contentBaseUrl, rel));
     }
@@ -2286,10 +2349,25 @@ const openChmDocument = async (item, openToken) => {
   }
   state.currentChmManifest = manifest;
   state.currentChmHref = normalizeChmHref(manifest.startPath || '');
-  stage.innerHTML = '<iframe id="reader-chm-iframe" class="reader-chm-iframe" title="CHM Reader" loading="eager" referrerpolicy="same-origin" sandbox="allow-same-origin"></iframe>';
+  stage.innerHTML = '<iframe id="reader-chm-iframe" class="reader-chm-iframe" title="CHM Reader" loading="eager" referrerpolicy="no-referrer"></iframe>';
   const iframe = getActiveContentFrame();
   if (!iframe) {
     throw new Error('CHM 阅读框初始化失败');
+  }
+  iframe.setAttribute('sandbox', manifest.renderBaseUrl ? 'allow-scripts' : 'allow-same-origin');
+  if (manifest.renderBaseUrl) {
+    state.chmSandbox = new ChmSandboxReader(iframe, manifest, {
+      onPosition: (position) => {
+        if (openToken !== state.openToken || accountSync.stopped || !position) return;
+        const changed = state.currentChmHref !== position.href;
+        state.currentChmHref = position.href;
+        if (changed) updateChmMeta();
+        updateReaderProgress(position);
+        if (!state.isOpening && !state.reflowing) persistCurrentPosition();
+      },
+      onSearch: () => { openSidebar(); readerNavigation?.selectTab('search'); },
+    });
+    state.chmSandbox.setStyle(buildReaderStyle());
   }
   const savedPosition = loadPosition(item);
   const restore = isValidChmPosition(state.currentChmRestore)
@@ -2297,8 +2375,8 @@ const openChmDocument = async (item, openToken) => {
     : (isValidChmPosition(savedPosition) ? savedPosition : null);
   bindIframeNavigation();
   await openChmHref((restore && restore.href) || manifest.startPath, restore);
-  await waitForCondition(() => openToken !== state.openToken || !!iframe.dataset.readerContentLoaded);
-  if (openToken === state.openToken && !iframe.dataset.readerContentLoaded) {
+  await waitForCondition(() => openToken !== state.openToken || !!getActiveContentFrame()?.dataset.readerContentLoaded);
+  if (openToken === state.openToken && !getActiveContentFrame()?.dataset.readerContentLoaded) {
     throw new Error('CHM 正文尚未成功加载，原阅读进度已保留');
   }
 };
@@ -2608,7 +2686,7 @@ const openPdfDocument = async (item, openToken) => {
   rendition.on('rendered', () => { void updateProgress(); });
   rendition.on('position-changed', () => { void updateProgress(); });
   await updateProgress();
-  updatePageButtons();
+  updateNavigationControls();
   bindStageNavigation();
   await finishDocumentOpen(item, openToken);
 };
@@ -2659,12 +2737,12 @@ const openIndex = async (index) => {
   updateShelfButton();
   cleanupRendition();
   renderSidebar();
-  updatePageButtons();
+  updateNavigationControls();
   setLoading(`正在打开 ${item.name || item.title || ''}`);
   try {
     await accountSync.prepare(item);
     if (openToken !== state.openToken || accountSync.stopped) return;
-    state.openRestorePosition = state.pendingRestorePosition?.path === item.path
+    state.openRestorePosition = state.pendingRestorePosition && state.pendingRestorePosition.path === item.path
       ? state.pendingRestorePosition.position : loadPosition(item);
     if (normalizeFormat(item.format) === 'pdf') {
       await openPdfDocument(item, openToken);
@@ -2676,7 +2754,7 @@ const openIndex = async (index) => {
       state.rendition = rendition;
       window.rendition = rendition;
       state.readerMode = 'scroll';
-      updatePageButtons();
+      updateNavigationControls();
       bindStageNavigation();
       rememberStageSize();
       const mounted = state.txtWindow.mounted.get(state.txtWindow.currentIndex);
@@ -2705,7 +2783,7 @@ const openIndex = async (index) => {
       if (openToken !== state.openToken) return;
       state.rendition = rendition;
       window.rendition = rendition;
-      updatePageButtons();
+      updateNavigationControls();
       bindStageNavigation();
       bindIframeNavigation();
       rememberStageSize();
@@ -2759,7 +2837,7 @@ const openIndex = async (index) => {
     state.rendition = rendition;
     window.rendition = rendition;
     installGenericScrollPosition(rendition);
-    updatePageButtons();
+    updateNavigationControls();
     const savedPosition = loadPosition(item);
     await rendition.renderTo(stage);
     stage.querySelectorAll('iframe').forEach((frame) => frame.setAttribute('sandbox', 'allow-same-origin'));
@@ -2841,6 +2919,7 @@ const openIndex = async (index) => {
   } finally {
     if (openToken === state.openToken) {
       state.isOpening = false;
+      updateNavigationControls();
       rememberStageSize();
     }
   }
@@ -2876,7 +2955,7 @@ const loadFolderMode = async () => {
   renderSidebar();
   updateMeta();
   if (data.truncated) {
-    metaEl.textContent += ` · 已截断至 ${state.items.length} 本`;
+    metaEl.appendChild(document.createTextNode(` · 已截断至 ${state.items.length} 本`));
   }
   await openIndex(state.currentIndex);
 };
@@ -2926,21 +3005,13 @@ if (fontIncreaseButton) {
   });
 }
 
-el('reader-prev-book').addEventListener('click', () => {
-  if (state.items.length > 1) openIndex(state.currentIndex - 1);
-});
-
-el('reader-next-book').addEventListener('click', () => {
-  if (state.items.length > 1) openIndex(state.currentIndex + 1);
-});
-
-prevPageButton.addEventListener('click', () => {
-  void turnPage(-1);
-});
-
-nextPageButton.addEventListener('click', () => {
-  void turnPage(1);
-});
+for (const [id, direction] of [['reader-prev-book', -1], ['reader-progress-prev-book', -1],
+  ['reader-next-book', 1], ['reader-progress-next-book', 1]]) {
+  el(id)?.addEventListener('click', () => { void openIndex(state.currentIndex + direction); });
+}
+for (const [id, direction] of [['reader-prev-section', -1], ['reader-next-section', 1]]) {
+  el(id)?.addEventListener('click', () => { void readerNavigation.navigateAdjacent(direction); });
+}
 
 el('reader-save-regex').addEventListener('click', () => {
   state.parserRegex = parserInput.value.trim();
@@ -2988,6 +3059,7 @@ window.addEventListener('pageshow', (event) => {
   if (event.persisted) void validateReaderSession();
 });
 window.addEventListener('recoll-account-change', (event) => {
+  if (!account) return;
   const detail = event.detail || {};
   if (['logout', 'session-changed', 'history-cleared'].includes(detail.type)) {
     clearAccountReader(detail.type === 'history-cleared'
@@ -3019,16 +3091,6 @@ window.setInterval(() => {
 }, 6000);
 
 window.addEventListener('keydown', (event) => {
-  if (event.key === 'Escape' && isMobileViewport() && !sidebar.classList.contains('is-hidden')) {
-    closeSidebar();
-    scheduleLayoutSync(true);
-    return;
-  }
-  if (event.key.toLowerCase() === 'h' && !event.ctrlKey && !event.metaKey && !event.altKey && shouldHandleStageKey(event)) {
-    event.preventDefault();
-    toggleToolbar();
-    return;
-  }
   if (!shouldHandleStageKey(event)) return;
   if (isPagedReaderMode(state.readerMode) && (event.key === 'ArrowLeft' || event.key === 'PageUp')) {
     event.preventDefault();
@@ -3085,7 +3147,7 @@ const settleReaderLayout = async () => {
 };
 
 const getReadingDocuments = () => {
-  if (!stage || state.rendition?.isNativePdf) return [];
+  if (!stage || state.rendition?.isNativePdf || state.chmSandbox) return [];
   const mounted = isEpubFormat(state.current?.format) ? state.epubWindow.mounted
     : isTxtFormat(state.current?.format) ? state.txtWindow.mounted : null;
   if (mounted) return [...mounted].map(([index, item]) => ({ index, frame: item.iframe, document: item.iframe?.contentDocument }))
@@ -3112,7 +3174,7 @@ const updateReaderProgress = (position = state.rendition?.getPosition?.() || (is
   let fraction = Number(position.percentage);
   const format = normalizeFormat(state.current.format);
   if (format === 'txt') fraction = getReadingFraction(position.chunkIndex, position.chunkProgressRatio, getTxtChunkDocList().length);
-  if (format === 'chm') {
+  if (format === 'chm' && !state.chmSandbox) {
     const win = getActiveContentFrame()?.contentWindow, doc = win?.document;
     const height = Math.max(doc?.body?.scrollHeight || 0, doc?.documentElement?.scrollHeight || 0);
     fraction = (win?.scrollY || 0) / Math.max(1, height - (win?.innerHeight || 0));
@@ -3135,6 +3197,7 @@ const updateDocumentControls = () => {
   if (el('reader-progress-range')) el('reader-progress-range').disabled = false;
   document.querySelectorAll('[data-reader-text-setting],.reader-font-controls').forEach((node) => { node.hidden = pdf; });
   el('reader-prev-book').hidden = el('reader-next-book').hidden = state.items.length < 2;
+  updateNavigationControls();
   updateReaderProgress();
 };
 
@@ -3163,6 +3226,7 @@ const navigateReaderTarget = async (target, { temporary = false } = {}) => {
   await settleReaderLayout();
   if (token !== state.openToken || navigationToken !== state.navigationToken || accountSync.stopped) return;
   if (target.kind !== 'pdf') {
+    if (state.chmSandbox && target.query) state.chmSandbox.find(target.query);
     const entry = getReadingDocuments().find((item) => item.index === target.index) || getReadingDocuments()[0];
     if (entry) scrollToTextMatch(entry.document, target, isChmFormat(state.current.format) ? null : stage, entry.frame);
   }
@@ -3213,11 +3277,7 @@ const handleInitialSearch = async () => {
 const bindReadingExtras = (doc) => {
   if (!doc?.body || doc.__recollExtrasBound) return;
   doc.__recollExtrasBound = true;
-  doc.addEventListener('keydown', (event) => {
-    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'f') {
-      event.preventDefault(); openSidebar(); readerNavigation?.selectTab('search');
-    }
-  });
+  readerExperience?.bindDocument(doc);
   doc.addEventListener('click', (event) => {
     if (doc.getSelection()?.toString()) return;
     const image = event.target.closest?.('img');
@@ -3225,7 +3285,7 @@ const bindReadingExtras = (doc) => {
     if (image && dialog) {
       event.preventDefault(); event.stopPropagation();
       const preview = el('reader-image-preview'); preview.src = image.currentSrc || image.src; preview.alt = image.alt || '文档插图';
-      dialog.showModal(); return;
+      readerExperience.showDialog(dialog, image); return;
     }
     const link = event.target.closest?.('a[href]');
     if (!link) return;
@@ -3249,7 +3309,7 @@ const bindReadingExtras = (doc) => {
       for (const child of node.childNodes) safe.append(copyNote(child));
       return safe;
     };
-    content.replaceChildren(copyNote(note)); noteDialog.showModal();
+    content.replaceChildren(copyNote(note)); readerExperience.showDialog(noteDialog, link);
   }, true);
 };
 
@@ -3283,11 +3343,12 @@ const initializeReadingTools = () => {
   });
   readerNavigation = new ReaderNavigation({
     getContext: () => ({ current: state.current, format: state.current?.format, rendition: state.rendition, stage,
+      position: state.rendition?.getPosition?.() || getChmCurrentPosition(),
       getDocuments: getReadingDocuments, epub: { toc: state.rendition?.book?.toc, chapters: getEpubChapterDocList() },
       txt: { manifest: state.txtWindow.manifest, contentUrl: state.txtWindow.contentUrl }, chm: { toc: state.currentChmManifest?.toc },
       fetchText: async (url, options) => (await fetchReaderResponse(url, options)).text(),
       fetchJson: async (url, options) => (await fetchReaderResponse(url, options)).json(),
-    }), onNavigate: navigateReaderTarget, onReturn: returnToReading,
+    }), onNavigate: navigateReaderTarget, onReturn: returnToReading, onState: updateNavigationControls,
     onKeep: async () => {
       const token = state.openToken, navigationToken = state.navigationToken;
       await waitForCondition(() => !state.layoutPending && !state.reflowing || accountSync.stopped || token !== state.openToken);
@@ -3317,9 +3378,12 @@ const initializeReadingTools = () => {
       await state.rendition.goToPosition(format === 'epub' ? { chapterDocIndex: index, chapterProgressRatio: value % 1, intraChapterOffset: -1 }
         : { chunkIndex: index, chunkProgressRatio: value % 1 });
     } else if (format === 'chm') {
-      const win = getActiveContentFrame()?.contentWindow, doc = win?.document;
-      const height = Math.max(doc?.body?.scrollHeight || 0, doc?.documentElement?.scrollHeight || 0);
-      win?.scrollTo(0, ratio * Math.max(0, height - win.innerHeight));
+      if (state.chmSandbox) state.chmSandbox.scrollToRatio(ratio);
+      else {
+        const win = getActiveContentFrame()?.contentWindow, doc = win?.document;
+        const height = Math.max(doc?.body?.scrollHeight || 0, doc?.documentElement?.scrollHeight || 0);
+        win?.scrollTo(0, ratio * Math.max(0, height - win.innerHeight));
+      }
     } else stage.scrollTop = ratio * Math.max(0, stage.scrollHeight - stage.clientHeight);
     persistCurrentPosition();
   });
@@ -3336,10 +3400,14 @@ const initializeReadingTools = () => {
       state.lastTextAnchor = captureTextAnchor(stage, getReadingDocuments()); updateReaderProgress();
     }, 120);
   }, { passive: true });
-  document.addEventListener('keydown', (event) => {
-    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'f') {
-      event.preventDefault(); openSidebar(); readerNavigation.selectTab('search');
-    }
+  readerExperience = new ReaderExperience({
+    root: readerApp, stage,
+    openSidebar: () => { openSidebar(); scheduleLayoutSync(true); },
+    closeSidebar: () => { closeSidebar(); scheduleLayoutSync(true); },
+    toggleToolbar, showToolbar: () => setToolbarHidden(false),
+    openSearch: () => { setToolbarHidden(false); openSidebar(); readerNavigation.selectTab('search'); scheduleLayoutSync(true); },
+    closeSettings: () => readerSettings.setOpen(false),
+    openSettings: () => readerSettings.setOpen(true),
   });
 };
 
@@ -3368,4 +3436,4 @@ syncViewportHeight();
 
 updateFontSizeUi();
 syncReaderModeUi();
-updatePageButtons();
+updateNavigationControls();

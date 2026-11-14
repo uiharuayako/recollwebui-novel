@@ -19,7 +19,10 @@ import shlex
 import posixpath
 import zipfile
 import sqlite3
+import secrets
+import random
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 from html import escape as html_escape
@@ -28,6 +31,7 @@ from recoll import recoll, rclextract, rclconfig
 import account_web
 from accounts import Store, NotFound, ValidationError, INTEGER_PREFERENCES
 from webui_data import ApplicationData
+from shares import ShareLinks
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
 bottle.TEMPLATE_PATH.insert(0, os.path.join(APP_ROOT, 'views'))
@@ -1021,6 +1025,8 @@ def make_reader_token(path, mimetype="", name=""):
     return appdata.token_for_path(path, mimetype, name)
 
 def read_reader_token(token):
+    if token.startswith('share.'):
+        return sharelinks.resource_payload(token)
     return appdata.token_payload(token)
 
 def resolve_doc_from_result_query(resnum, query=None):
@@ -1072,9 +1078,10 @@ def build_reader_item(doc, config, path):
         item["manifestUrl"] = account_web.app_url(f"/api/reader/epub/{urlquote(token)}/manifest")
     return appdata.reader_metadata(item, doc=doc, config=config)
 
-def scan_reader_folder(current_doc, config):
-    current_path = get_reader_path_for_doc(current_doc, config)
-    root_dir = os.path.dirname(current_path)
+def scan_reader_folder(current_doc, config, root_dir=None):
+    current_path = get_reader_path_for_doc(current_doc, config) if current_doc is not None else None
+    root_dir = os.path.realpath(root_dir or os.path.dirname(current_path))
+    shelf = appdata.folder_shelf_metadata(root_dir, config)
     items = []
     seen = set()
     truncated = False
@@ -1129,7 +1136,7 @@ def scan_reader_folder(current_doc, config):
             current_item = item
             break
 
-    if current_item is None and os.path.isfile(current_path):
+    if current_item is None and current_path and os.path.isfile(current_path):
         current_name = os.path.basename(current_path)
         current_format = get_reader_format_from_name(current_name)
         if current_format in READER_SUPPORTED_FORMATS:
@@ -1159,9 +1166,10 @@ def scan_reader_folder(current_doc, config):
                 items.pop()
                 truncated = True
 
-    folder_key = appdata.folder_key(root_dir)
+    folder_key = appdata.folder_key(root_dir, config)
     for item in items:
-        appdata.reader_metadata(item, config=config, folder_key=folder_key)
+        appdata.reader_metadata(item, config=config, folder_key=folder_key,
+                                shelf_document_id=shelf['documentId'])
     resume = account_store.get_folder_resume(account_web.current_user()['id'], folder_key)
     resume_warning = ''
     if resume and bottle.request.query.get('resume') != '0':
@@ -1175,19 +1183,23 @@ def scan_reader_folder(current_doc, config):
                 if os.path.commonpath([resumed['source_path'], root_dir]) == root_dir:
                     resumed_doc = appdata.as_recoll_doc(resumed['id'])
                     resumed_item = build_reader_item(resumed_doc, config, resumed['source_path'])
-                    appdata.reader_metadata(resumed_item, config=config, folder_key=folder_key)
+                    appdata.reader_metadata(resumed_item, config=config, folder_key=folder_key,
+                                            shelf_document_id=shelf['documentId'])
                     items.insert(0, resumed_item)
                     current_index = 0
                     if len(items) > READER_FOLDER_SCAN_LIMIT:
                         items.pop()
                         truncated = True
                 else:
-                    resume_warning = '上次阅读的文件已不在该目录中，已打开本次选择的文件。'
+                    resume_warning = '上次阅读的文件已不在该目录中，已打开其他可用文件。'
             except (NotFound, ValidationError, OSError):
-                resume_warning = '上次阅读的文件已不可用，已打开本次选择的文件。'
+                resume_warning = '上次阅读的文件已不可用，已打开其他可用文件。'
+    if not items:
+        bottle.abort(404, '该文件夹中没有可阅读的文件')
     return {
         "root": root_dir,
         "folderKey": folder_key,
+        "shelf": shelf,
         "resumeWarning": resume_warning,
         "currentIndex": current_index,
         "items": items,
@@ -1289,8 +1301,9 @@ def get_config():
     # get mountpoints
     config['mounts'] = {}
     for d in config['dirs']:
-        name = 'mount_%s_%s' % (account_web.current_user()['id'], urlquote(d,''))
-        cookie_value = bottle.request.get_cookie(name)
+        user = account_web.current_user()
+        name = 'mount_%s_%s' % (user['id'], urlquote(d,'')) if user else ''
+        cookie_value = bottle.request.get_cookie(name) if user else None
         mount_value = account_web.read_payload(cookie_value, 'device-mount') if cookie_value else None
         config['mounts'][d] = select([mount_value.get('url') if mount_value else None,
                                       rclconf.getConfParam(f"webui_mount_{d}"),
@@ -1384,8 +1397,8 @@ def query_to_recoll_string(q):
     return qs
 #}}}
 #{{{ recoll_initsearch
-def recoll_initsearch(q):
-    config = get_config()
+def recoll_initsearch(q, config=None):
+    config = get_config() if config is None else config
     try:
         appdata.validate_query(q)
     except ValidationError as exc:
@@ -1652,9 +1665,29 @@ def server_staticdoc(path):
 @bottle.view('main')
 def main():
     config = get_config()
+    daily_date = datetime.datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()
+    recommendation_notice = ''
+    try:
+        candidates = appdata.search_recommendations(config)
+    except sqlite3.Error:
+        candidates = []
+        recommendation_notice = '搜索推荐暂时无法加载，请稍后刷新重试。'
+    recommendations = random.sample(candidates, min(6, len(candidates)))
+    saved = {item['document_id'] for item in candidates}
+    try:
+        daily = appdata.daily_recommendations(config, daily_date)
+    except (bottle.HTTPError, sqlite3.Error):
+        daily = []
+        recommendation_notice += '每日推荐暂时无法加载，请稍后刷新重试。'
+    for item in daily:
+        item['on_recommendation'] = item['document_id'] in saved
     bottle.response.headers['Vary'] = 'Cookie'
     return { 'dirs': get_dirs(config['dirs'], config['dirdepth']),
             'query': get_query(config), 'sorts': SORTS, 'config': config,
+            'search_recommendations': recommendations, 'daily_recommendations': daily,
+            'recommendation_count': len(candidates), 'recommendation_notice': recommendation_notice,
+            'recommendation_refresh': secrets.token_urlsafe(8),
+            'daily_date': daily_date,
             'recent_readings': account_store.list_readings(account_web.current_user()['id'], limit=5)['items']}
 #}}}
 #{{{ results
@@ -1677,7 +1710,7 @@ def results():
         if event:
             account_store.fail_search(account_web.current_user()['id'], event['id'])
         bottle.abort(400, '查询执行失败，请检查检索表达式和筛选条件')
-    appdata.finish_search(event, query, config, nres)
+    recommendation_ids = []
     for result in res:
         try:
             # Use the source URL before PDF search anchors were appended.
@@ -1687,9 +1720,18 @@ def results():
             result['reader_supported'] = ref['format'] in READER_SUPPORTED_FORMATS
             result['shelf_handle'] = account_web.sign_payload({'document_id': ref['id']}, 'shelf-add')
             result['on_shelf'] = account_store.is_on_shelf(account_web.current_user()['id'], ref['id'])
+            if result['reader_supported'] and not ref['ipath']:
+                result['recommendation_handle'] = account_web.sign_payload({'document_id': ref['id']}, 'recommendation-add')
+                recommendation_ids.append(ref['id'])
         except (NotFound, ValidationError, OSError, sqlite3.Error):
             result['document_id'] = None
             bottle.request.environ['recoll.notice'] = '搜索已完成，部分书架操作暂不可用，请稍后重试。'
+    appdata.finish_search(event, query, config, nres,
+                          random.sample(list(dict.fromkeys(recommendation_ids)), min(3, len(set(recommendation_ids)))))
+    saved_recommendations = {item['document_id'] for item in account_store.list_recommendations(
+        account_web.current_user()['id'], library_key=appdata.scope(config))}
+    for result in res:
+        result['on_recommendation'] = result.get('document_id') in saved_recommendations
     if config['maxresults'] == 0:
         config['maxresults'] = nres
     if config['perpage'] == 0:
@@ -1718,7 +1760,7 @@ def reader():
             encoding="utf-8",
             errors="strict",
         )
-        if key not in ("mode", "resnum", "document_id", "return_to", "reader_search", "reader_term", "reader_page")
+        if key not in ("mode", "resnum", "document_id", "folder_id", "return_to", "reader_search", "reader_term", "reader_page")
     ]
     results_query_string = urlencode(search_query, doseq=True, encoding='utf-8')
     results_url = account_web.app_url('/results') + '?' + results_query_string
@@ -1775,7 +1817,16 @@ def reader_book():
 @bottle.route('/api/reader/folder')
 def reader_folder():
     resnum = select_int([bottle.request.query.resnum, -1], default=-1)
-    if bottle.request.query.get('document_id'):
+    root_dir = None
+    if bottle.request.query.get('folder_id'):
+        try:
+            config = get_config()
+            folder = appdata.folder(bottle.request.query.folder_id, config)
+            root_dir = folder['source_path']
+            doc = None
+        except (NotFound, ValidationError) as exc:
+            bottle.abort(404, str(exc))
+    elif bottle.request.query.get('document_id'):
         try:
             config = get_config()
             doc = appdata.as_recoll_doc(bottle.request.query.document_id)
@@ -1783,14 +1834,18 @@ def reader_folder():
             bottle.abort(404, str(exc))
     else:
         config, query, rclq, db, doc = resolve_doc_from_result_query(resnum)
-    if not is_reader_supported_doc(doc):
+    if doc is not None and not is_reader_supported_doc(doc):
         bottle.abort(400, "Unsupported format for reader")
-    folder_data = scan_reader_folder(doc, config)
+    try:
+        folder_data = scan_reader_folder(doc, config, root_dir=root_dir)
+    except (NotFound, ValidationError) as exc:
+        bottle.abort(404, str(exc))
     bottle.response.content_type = 'application/json; charset=utf-8'
     return json.dumps({
         "mode": "folder",
         "root": folder_data["root"],
         "folderKey": folder_data["folderKey"],
+        "shelf": folder_data["shelf"],
         "resumeWarning": folder_data["resumeWarning"],
         "currentIndex": folder_data["currentIndex"],
         "count": folder_data["count"],
@@ -1872,7 +1927,7 @@ def reader_txt_manifest(token):
         {
             "format": "txt",
             "title": title,
-            "path": path,
+            "path": payload.get('name', '') if bottle.request.environ.get('recoll.share') else path,
             "size": manifest.get("size", 0),
             "charset": manifest.get("charset", "utf-8"),
             "chunkCount": manifest.get("chunkCount", 0),
@@ -2033,6 +2088,11 @@ def reader_chm_manifest(token):
 
     files_root, manifest = get_reader_chm_content_root(path)
     content_prefix = account_web.app_url(f"/api/reader/chm/{urlquote(token)}/content")
+    render_channel = secrets.token_urlsafe(24)
+    render_ticket = (token + '.' + render_channel if bottle.request.environ.get('recoll.share') else
+                     account_web.sign_payload(
+                         {'document_id': payload['document_id'], 'channel': render_channel}, 'chm-render'))
+    render_prefix = account_web.app_url(f"/api/reader/chm-render/{urlquote(render_ticket)}/content")
     toc = [
         {
             "label": item.get("label", "Untitled"),
@@ -2051,16 +2111,20 @@ def reader_chm_manifest(token):
             "startPath": manifest.get("start_path", ""),
             "startUrl": build_reader_content_url(content_prefix, manifest.get("start_path", "")),
             "contentBaseUrl": f"{content_prefix}/",
+            "renderBaseUrl": f"{render_prefix}/",
+            "renderStartUrl": build_reader_content_url(render_prefix, manifest.get("start_path", "")),
+            "renderChannel": render_channel,
             "toc": toc,
             "count": len(toc),
         },
         ensure_ascii=False,
     )
 #}}}
-def rewrite_chm_html_urls(raw_bytes, token):
+def rewrite_chm_html_urls(raw_bytes, token=None, prefix=None):
     """Rewrite absolute paths in CHM HTML content to route through the API.
     Operates at byte level to preserve the original encoding of the file."""
-    prefix_bytes = account_web.app_url(f'/api/reader/chm/{urlquote(token)}/content').encode('utf-8')
+    prefix_bytes = (prefix if prefix is not None else
+                    account_web.app_url(f'/api/reader/chm/{urlquote(token)}/content')).encode('utf-8')
 
     def replace_url(match):
         return match.group(1) + b'=' + match.group(2) + prefix_bytes + match.group(3) + match.group(2)
@@ -2150,6 +2214,132 @@ def reader_chm_content(token, relpath=""):
     bottle.response.headers['Content-Length'] = len(raw)
     return raw
 #}}}
+
+def chm_resource_session():
+    """Cookie-free authentication is confined to this one read-only route."""
+    if bottle.request.method not in ('GET', 'HEAD'):
+        return None
+    match = re.fullmatch(r'/api/reader/chm-render/([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/content(?:/.*)?',
+                         bottle.request.path)
+    return account_web.chm_render_session(match.group(1), account_store) if match else None
+
+
+def chm_script_charset(raw):
+    try:
+        raw.decode('utf-8-sig')
+        return 'utf-8'
+    except UnicodeDecodeError:
+        return 'gb18030'
+
+
+def chm_render_origin():
+    parts = bottle.request.urlparts
+    if parts.scheme not in ('http', 'https') or not re.fullmatch(
+            r'(?:[A-Za-z0-9.-]+|\[[A-Fa-f0-9:]+\])(?::[0-9]{1,5})?', parts.netloc):
+        bottle.abort(400, 'Invalid request origin')
+    try:
+        port = parts.port
+    except ValueError:
+        bottle.abort(400, 'Invalid request origin')
+    host = parts.hostname
+    if ':' in host:
+        host = f'[{host}]'
+    suffix = f':{port}' if port and port != (443 if parts.scheme == 'https' else 80) else ''
+    return f'{parts.scheme}://{host}{suffix}'
+
+
+def inject_chm_bridge(raw, render_base, channel, origin):
+    """Add the reader bridge to response bytes; cached archive entries stay intact."""
+    script_url = origin + account_web.app_url('/static/reader/chm-bridge.js')
+    attrs = {'src': script_url, 'data-chm-root': render_base,
+             'data-chm-channel': channel, 'data-chm-origin': origin}
+    bridge = ('<script ' + ' '.join(f'{key}="{html_escape(value, quote=True)}"'
+                                   for key, value in attrs.items()) + '></script>').encode('ascii')
+    # Fetch Metadata is absent on ordinary LAN HTTP. A synchronous guard also
+    # protects direct top-level visits there, before the external bridge loads.
+    # CSP policies accumulate: the meta policy cannot be removed by book code.
+    guard = (b"<script>(function(){if(window===window.top){var chmPolicy=document.createElement('meta');"
+             b"chmPolicy.httpEquiv='Content-Security-Policy';"
+             b'chmPolicy.content="default-src \'none\'; script-src \'none\'; frame-src \'none\'; '
+             b'connect-src \'none\'; object-src \'none\'";document.head.appendChild(chmPolicy);}})();</script>')
+    # Keep only inert leading markup before the guard, including the doctype
+    # that controls standards/quirks mode. Never search for a later <head>:
+    # a book can have executable event handlers or frames before that element.
+    offset = 3 if raw.startswith(b'\xef\xbb\xbf') else 0
+    while True:
+        whitespace = re.match(rb'\s*', raw[offset:])
+        offset += whitespace.end()
+        if not raw.startswith(b'<!--', offset):
+            break
+        end = raw.find(b'-->', offset + 4)
+        if end < 0:
+            break
+        comment = raw[offset + 4:end]
+        # Malformed HTML comments can close early (<!--> or --!>). Do not
+        # preserve those before the guard merely because a later --> exists.
+        if comment.startswith((b'>', b'->')) or b'--' in comment:
+            break
+        offset = end + 3
+    quoted_id = rb'(?:"[^"]*"|\'[^\']*\')'
+    doctype = re.match(rb'<!doctype\s+html(?:\s+(?:public\s+' + quoted_id +
+                       rb'(?:\s+' + quoted_id + rb')?|system\s+' + quoted_id + rb'))?\s*>',
+                       raw[offset:], re.I)
+    if doctype:
+        offset += doctype.end()
+    return raw[:offset] + b'<head>' + guard + bridge + b'</head>' + raw[offset:]
+
+
+@bottle.route('/api/reader/chm-render/<ticket>/content')
+@bottle.route('/api/reader/chm-render/<ticket>/content/<relpath:path>')
+def reader_chm_render_content(ticket, relpath=''):
+    payload = (sharelinks.resource_payload(ticket, render=True) if ticket.startswith('share.') else
+               account_web.read_payload(ticket, 'chm-render'))
+    if not isinstance(payload, dict) or not payload.get('channel'):
+        bottle.abort(403, 'Invalid or expired CHM render ticket')
+    try:
+        document = appdata.document(payload['document_id'])
+    except (KeyError, NotFound, ValidationError):
+        bottle.abort(404, 'CHM document unavailable')
+    if document['format'] != 'chm':
+        bottle.abort(400, 'Not a CHM document')
+    files_root, manifest = get_reader_chm_content_root(document['source_path'])
+    file_path, resolved_relpath = resolve_chm_content_file(files_root, manifest, relpath)
+    if not file_path:
+        bottle.abort(404, 'CHM entry not found')
+    with open(file_path, 'rb') as handle:
+        raw = handle.read()
+    origin = chm_render_origin()
+    prefix = account_web.app_url(f'/api/reader/chm-render/{urlquote(ticket)}/content')
+    render_base = origin + prefix + '/'
+    bridge_url = origin + account_web.app_url('/static/reader/chm-bridge.js')
+    fetch_destination = bottle.request.headers.get('Sec-Fetch-Dest', '')
+    # Non-localhost HTTP browsers omit Sec-Fetch-* even for frames/scripts.
+    # Explicit top-level navigations stay inert; the guard covers absent hints.
+    framed_document = fetch_destination in ('', 'iframe', 'frame')
+    script_policy = f"'unsafe-inline' {render_base} {bridge_url}" if framed_document else "'none'"
+    frame_policy = render_base if framed_document else "'none'"
+    bottle.request.environ['recoll.chm_render_policy'] = (
+        ("sandbox allow-scripts; " if framed_document else "sandbox; ") + "default-src 'none'; "
+        f"script-src {script_policy}; "
+        f"style-src 'unsafe-inline' {render_base}; img-src {render_base} data: blob:; "
+        f"font-src {render_base} data:; media-src {render_base} blob:; frame-src {frame_policy}; "
+        "connect-src 'none'; object-src 'none'; worker-src 'none'; base-uri 'none'; form-action 'none'")
+    extension = os.path.splitext(file_path)[1].lower()
+    mimetype = mimetypes.guess_type(file_path)[0] or 'application/octet-stream'
+    if extension in ('.html', '.htm', '.hhc', '.xhtml'):
+        mimetype = detect_chm_html_mimetype(raw, 'text/html')
+        if ';' not in mimetype:
+            mimetype += '; charset=' + chm_script_charset(raw)
+        raw = rewrite_chm_html_urls(raw, prefix=prefix)
+        if framed_document:
+            raw = inject_chm_bridge(raw, render_base, payload['channel'], origin)
+    elif extension == '.js' or (extension == '.txt' and fetch_destination in ('', 'script')):
+        mimetype = 'application/javascript; charset=' + chm_script_charset(raw)
+    bottle.response.content_type = mimetype
+    bottle.response.headers['X-Reader-Path'] = resolved_relpath
+    bottle.response.headers['Content-Length'] = len(raw)
+    return raw
+
 #{{{ preview
 @bottle.route('/preview/<resnum:int>')
 def preview(resnum):
@@ -2328,14 +2518,20 @@ def main():
 account_web.install(bottle.default_app(), account_store, callbacks={
     'settings_locked': lambda: bool(get_config()['rclc_nosettings']),
     'legacy_import': lambda data: appdata.import_legacy(data),
+    'chm_resource_session': chm_resource_session,
+    'public_share_request': lambda: sharelinks.public_request(),
 })
 appdata = ApplicationData(bottle.default_app(), account_store, sys.modules[__name__])
+sharelinks = ShareLinks(bottle.default_app(), account_store, sys.modules[__name__], appdata)
 
 
 @bottle.hook('after_request')
 def protect_document_responses():
     path = bottle.request.path
-    if path == '/reader':
+    if path.startswith('/api/reader/chm-render/'):
+        bottle.response.headers['Content-Security-Policy'] = bottle.request.environ.get(
+            'recoll.chm_render_policy', "sandbox; default-src 'none'; form-action 'none'")
+    if path == '/reader' or re.fullmatch(r'/s/[A-Za-z0-9_-]{64}', path):
         # Generated about:blank/blob reader frames inherit this policy, unlike
         # the CSP on the source file fetched as an ArrayBuffer by the engine.
         bottle.response.headers['Content-Security-Policy'] = (

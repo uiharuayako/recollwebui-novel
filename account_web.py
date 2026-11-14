@@ -19,6 +19,7 @@ import bottle
 
 SESSION_COOKIE = 'recoll_session'
 LOGIN_CSRF_COOKIE = 'recoll_login_csrf'
+REGISTER_CSRF_COOKIE = 'recoll_register_csrf'
 FLAGS = ('search_history_enabled', 'reading_history_enabled', 'progress_sync_enabled')
 
 
@@ -92,6 +93,21 @@ def read_payload(token, purpose):
     if data.get('purpose') != purpose or data.get('user_id') != user['id'] or data.get('session_id') != session['id']:
         return None
     return data.get('payload')
+
+
+def chm_render_session(token, store):
+    """Authenticate only a signed CHM resource capability, never an app session."""
+    data = _decode(token)
+    if not data or data.get('purpose') != 'chm-render':
+        return None
+    payload = data.get('payload')
+    if (not isinstance(payload, dict) or not isinstance(payload.get('document_id'), str)
+            or not isinstance(payload.get('channel'), str) or not payload['channel']):
+        return None
+    session = store.get_resource_session(data.get('session_id'))
+    if not session or session['user_id'] != data.get('user_id'):
+        return None
+    return session
 
 
 def account_context():
@@ -218,7 +234,7 @@ def install(app, store, callbacks=None):
                 return function(*args, **kwargs)
             except bottle.HTTPResponse:
                 raise
-            except sqlite3.Error:
+            except (sqlite3.Error, OSError):
                 _fail(503, 'storage_unavailable', '账号存储暂时不可用，请稍后重试。')
             except Exception as error:
                 # Store's public exceptions are deliberately mapped to generic
@@ -249,17 +265,29 @@ def install(app, store, callbacks=None):
         try:
             if not store.initialized():
                 _fail(503, 'setup_required', '服务尚未完成账号初始化，请联系管理员。')
+            # Public shares have their own capability boundary. Even an already
+            # logged-in visitor reads them without account data or write access.
+            if callbacks.get('public_share_request') and callbacks['public_share_request']():
+                return
             token = bottle.request.get_cookie(SESSION_COOKIE)
             session = store.get_session(token) if token else None
+            resource_session = False
+            # Opaque CHM frames cannot send SameSite session cookies. Only their
+            # narrowly scoped GET/HEAD route can supply a signed resource ticket.
+            # An explicitly supplied cookie, including an invalid one, wins.
+            if SESSION_COOKIE not in bottle.request.cookies and callbacks.get('chm_resource_session'):
+                session = callbacks['chm_resource_session']()
+                resource_session = bool(session)
             if session:
                 env['recoll.user'], env['recoll.session'] = session['user'], session
                 env['recoll.settings'] = session.get('settings', {})
-                env['recoll.csrf'] = _b64(hmac.new(store.secret(), ('csrf:' + str(session['id'])).encode(), hashlib.sha256).digest())
+                if not resource_session:
+                    env['recoll.csrf'] = _b64(hmac.new(store.secret(), ('csrf:' + str(session['id'])).encode(), hashlib.sha256).digest())
         except bottle.HTTPResponse:
             raise
         except Exception:
             _fail(503, 'storage_unavailable', '账号存储暂时不可用，请稍后重试。')
-        if not session and path != '/login':
+        if not session and path not in ('/login', '/register'):
             if _api_request() or bottle.request.method not in ('GET', 'HEAD'):
                 _fail(401, 'authentication_required', '登录已过期，请重新登录。')
             target = app_url(path)
@@ -272,10 +300,12 @@ def install(app, store, callbacks=None):
             bottle.redirect(app_url('/account/password'))
         if bottle.request.method not in ('GET', 'HEAD', 'OPTIONS'):
             supplied = bottle.request.headers.get('X-CSRF-Token') or bottle.request.forms.get('csrf', '')
-            if path == '/login':
-                cookie = bottle.request.get_cookie(LOGIN_CSRF_COOKIE, '')
+            if path in ('/login', '/register'):
+                cookie_name, purpose = ((LOGIN_CSRF_COOKIE, 'login-csrf') if path == '/login'
+                                        else (REGISTER_CSRF_COOKIE, 'register-csrf'))
+                cookie = bottle.request.get_cookie(cookie_name, '')
                 data = _decode(cookie)
-                valid = data and data.get('purpose') == 'login-csrf' and cookie and hmac.compare_digest(str(cookie), str(supplied))
+                valid = data and data.get('purpose') == purpose and cookie and hmac.compare_digest(str(cookie), str(supplied))
             else:
                 valid = csrf_token() and hmac.compare_digest(str(csrf_token()), str(supplied))
             if not valid:
@@ -287,14 +317,34 @@ def install(app, store, callbacks=None):
         if not bottle.request.path.startswith('/static/'):
             bottle.response.set_header('Cache-Control', 'no-store')
             bottle.response.set_header('Pragma', 'no-cache')
-            bottle.response.set_header('Referrer-Policy', 'same-origin')
+            bottle.response.set_header('Referrer-Policy',
+                                       'no-referrer' if (bottle.request.environ.get('recoll.share')
+                                                        or bottle.request.path.startswith(('/s/', '/api/reader/chm-render/')))
+                                       else 'same-origin')
             bottle.response.set_header('Vary', 'Cookie')
 
+    def anonymous_csrf(cookie_name, purpose):
+        token = _encode({'purpose': purpose, 'nonce': secrets.token_urlsafe(24), 'exp': int(time.time()) + 1800})
+        bottle.response.set_cookie(cookie_name, token, max_age=1800, **_cookie_options(networks))
+        return token
+
     def login_page(error='', next_path=None):
-        token = _encode({'purpose': 'login-csrf', 'nonce': secrets.token_urlsafe(24), 'exp': int(time.time()) + 1800})
-        bottle.response.set_cookie(LOGIN_CSRF_COOKIE, token, max_age=1800, **_cookie_options(networks))
+        token = anonymous_csrf(LOGIN_CSRF_COOKIE, 'login-csrf')
+        target = safe_next(next_path if next_path is not None else bottle.request.query.get('next', ''))
         return render('account_login', error=error, login_csrf=token,
-                      next_path=safe_next(next_path if next_path is not None else bottle.request.query.get('next', '')))
+                      next_path=target, register_url=app_url('/register') + '?' + urlencode({'next': target}),
+                      registration_enabled=store.registration_settings()['enabled'],
+                      registered=bottle.request.query.get('registered') == '1')
+
+    def register_page(error='', next_path=None, username=''):
+        registration = store.registration_settings()
+        if not registration['enabled']:
+            _fail(403, 'registration_closed', '管理员暂未开放注册。')
+        target = safe_next(next_path if next_path is not None else bottle.request.query.get('next', ''))
+        return render('account_register', error=error, registration=registration,
+                      registration_csrf=anonymous_csrf(REGISTER_CSRF_COOKIE, 'register-csrf'),
+                      next_path=target, username=username,
+                      login_url=app_url('/login') + '?' + urlencode({'next': target}))
 
     @app.get('/login')
     @guarded
@@ -327,6 +377,42 @@ def install(app, store, callbacks=None):
         bottle.response.set_cookie(SESSION_COOKIE, token, **options)
         bottle.response.delete_cookie(LOGIN_CSRF_COOKIE, **_cookie_options(networks))
         bottle.redirect(app_url('/account/password') if session['user'].get('must_change_password') else target)
+
+    @app.get('/register')
+    @guarded
+    def register():
+        if current_user():
+            bottle.redirect(safe_next(bottle.request.query.get('next', '')))
+        return register_page()
+
+    @app.post('/register')
+    @guarded
+    def register_submit():
+        values = bottle.request.forms
+        target = safe_next(values.get('next', ''))
+        if current_user():
+            bottle.redirect(target)
+        username = values.getunicode('username', '')
+        try:
+            store.register_user(username, values.getunicode('password', ''),
+                                activation_code=values.getunicode('activation_code', ''),
+                                address=_request_address(networks))
+        except Exception as error:
+            name = type(error).__name__
+            if name == 'RegistrationClosed':
+                _fail(403, 'registration_closed', '管理员暂未开放注册。')
+            if name == 'RegistrationThrottled':
+                bottle.response.status = 429
+                return register_page('注册尝试过于频繁，请稍后重试。', target, username)
+            messages = {'RegistrationError': (400, '激活码不正确，请联系管理员获取有效激活码。'),
+                        'ValidationError': (400, '用户名需为 3–32 位英文字母、数字或 . _ -，密码需为 15–128 个字符。'),
+                        'ConflictError': (409, '用户名已被使用，请换一个用户名。')}
+            if name not in messages:
+                raise
+            bottle.response.status, message = messages[name]
+            return register_page(message, target, username)
+        bottle.response.delete_cookie(REGISTER_CSRF_COOKIE, **_cookie_options(networks))
+        bottle.redirect(app_url('/login') + '?' + urlencode({'registered': '1', 'next': target}))
 
     @app.post('/logout')
     @guarded
@@ -411,7 +497,19 @@ def install(app, store, callbacks=None):
     @guarded
     def admin():
         admin_user()
-        return render('account_admin', users=store.list_users(), saved=bottle.request.query.get('saved') == '1')
+        return render('account_admin', users=store.list_users(), saved=bottle.request.query.get('saved') == '1',
+                      registration=store.registration_settings(),
+                      registration_saved=bottle.request.query.get('registration_saved') == '1')
+
+    @app.post('/admin/registration')
+    @guarded
+    def registration_settings_submit():
+        actor = admin_user()
+        values = bottle.request.forms
+        store.configure_registration(actor, enabled=values.get('enabled') == '1',
+                                     activation_required=values.get('activation_required') == '1',
+                                     activation_code=values.getunicode('activation_code', ''))
+        bottle.redirect(app_url('/admin/users?registration_saved=1'))
 
     @app.post('/admin/users')
     @guarded
